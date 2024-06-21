@@ -16,7 +16,6 @@ import (
 
 	"github.com/cortexproject/cortex/pkg/cortexpb"
 	"github.com/cortexproject/cortex/pkg/ingester/client"
-	"github.com/cortexproject/cortex/pkg/prom1/storage/metric"
 	"github.com/cortexproject/cortex/pkg/querier/series"
 	"github.com/cortexproject/cortex/pkg/util"
 	"github.com/cortexproject/cortex/pkg/util/chunkcompat"
@@ -32,18 +31,17 @@ type Distributor interface {
 	LabelValuesForLabelNameStream(ctx context.Context, from, to model.Time, label model.LabelName, matchers ...*labels.Matcher) ([]string, error)
 	LabelNames(context.Context, model.Time, model.Time) ([]string, error)
 	LabelNamesStream(context.Context, model.Time, model.Time) ([]string, error)
-	MetricsForLabelMatchers(ctx context.Context, from, through model.Time, matchers ...*labels.Matcher) ([]metric.Metric, error)
-	MetricsForLabelMatchersStream(ctx context.Context, from, through model.Time, matchers ...*labels.Matcher) ([]metric.Metric, error)
+	MetricsForLabelMatchers(ctx context.Context, from, through model.Time, matchers ...*labels.Matcher) ([]model.Metric, error)
+	MetricsForLabelMatchersStream(ctx context.Context, from, through model.Time, matchers ...*labels.Matcher) ([]model.Metric, error)
 	MetricsMetadata(ctx context.Context) ([]scrape.MetricMetadata, error)
 }
 
-func newDistributorQueryable(distributor Distributor, streamingMetdata bool, iteratorFn chunkIteratorFunc, queryIngestersWithin time.Duration, queryStoreForLabels bool) QueryableWithFilter {
+func newDistributorQueryable(distributor Distributor, streamingMetdata bool, iteratorFn chunkIteratorFunc, queryIngestersWithin time.Duration) QueryableWithFilter {
 	return distributorQueryable{
 		distributor:          distributor,
 		streamingMetdata:     streamingMetdata,
 		iteratorFn:           iteratorFn,
 		queryIngestersWithin: queryIngestersWithin,
-		queryStoreForLabels:  queryStoreForLabels,
 	}
 }
 
@@ -52,7 +50,6 @@ type distributorQueryable struct {
 	streamingMetdata     bool
 	iteratorFn           chunkIteratorFunc
 	queryIngestersWithin time.Duration
-	queryStoreForLabels  bool
 }
 
 func (d distributorQueryable) Querier(mint, maxt int64) (storage.Querier, error) {
@@ -63,7 +60,6 @@ func (d distributorQueryable) Querier(mint, maxt int64) (storage.Querier, error)
 		streamingMetadata:    d.streamingMetdata,
 		chunkIterFn:          d.iteratorFn,
 		queryIngestersWithin: d.queryIngestersWithin,
-		queryStoreForLabels:  d.queryStoreForLabels,
 	}, nil
 }
 
@@ -78,7 +74,6 @@ type distributorQuerier struct {
 	streamingMetadata    bool
 	chunkIterFn          chunkIteratorFunc
 	queryIngestersWithin time.Duration
-	queryStoreForLabels  bool
 }
 
 // Select implements storage.Querier interface.
@@ -92,19 +87,11 @@ func (q *distributorQuerier) Select(ctx context.Context, sortSeries bool, sp *st
 		minT, maxT = sp.Start, sp.End
 	}
 
-	// If the querier receives a 'series' query, it means only metadata is needed.
-	// For the specific case where queryStoreForLabels is disabled
-	// we shouldn't apply the queryIngestersWithin time range manipulation.
-	// Otherwise we'll end up returning no series at all for
-	// older time ranges (while in Cortex we do ignore the start/end and always return
-	// series in ingesters).
-	shouldNotQueryStoreForMetadata := (sp != nil && sp.Func == "series" && !q.queryStoreForLabels)
-
-	// If queryIngestersWithin is enabled, we do manipulate the query mint to query samples up until
+	// We should manipulate the query mint to query samples up until
 	// now - queryIngestersWithin, because older time ranges are covered by the storage. This
 	// optimization is particularly important for the blocks storage where the blocks retention in the
 	// ingesters could be way higher than queryIngestersWithin.
-	if q.queryIngestersWithin > 0 && !shouldNotQueryStoreForMetadata {
+	if q.queryIngestersWithin > 0 {
 		now := time.Now()
 		origMinT := minT
 		minT = max(minT, util.TimeToMillis(now.Add(-q.queryIngestersWithin)))
@@ -123,7 +110,7 @@ func (q *distributorQuerier) Select(ctx context.Context, sortSeries bool, sp *st
 	// See: https://github.com/prometheus/prometheus/pull/8050
 	if sp != nil && sp.Func == "series" {
 		var (
-			ms  []metric.Metric
+			ms  []model.Metric
 			err error
 		)
 
@@ -148,13 +135,6 @@ func (q *distributorQuerier) streamingSelect(ctx context.Context, sortSeries boo
 		return storage.ErrSeriesSet(err)
 	}
 
-	// we should sort the series if we need to merge them even if sortSeries is not required by the querier
-	sortSeries = sortSeries || (len(results.Timeseries) > 0 && len(results.Chunkseries) > 0)
-	sets := []storage.SeriesSet(nil)
-	if len(results.Timeseries) > 0 {
-		sets = append(sets, newTimeSeriesSeriesSet(sortSeries, results.Timeseries))
-	}
-
 	serieses := make([]storage.Series, 0, len(results.Chunkseries))
 	for _, result := range results.Chunkseries {
 		// Sometimes the ingester can send series that have no data.
@@ -177,18 +157,11 @@ func (q *distributorQuerier) streamingSelect(ctx context.Context, sortSeries boo
 		})
 	}
 
-	if len(serieses) > 0 {
-		sets = append(sets, series.NewConcreteSeriesSet(sortSeries || len(sets) > 0, serieses))
-	}
-
-	if len(sets) == 0 {
+	if len(serieses) == 0 {
 		return storage.EmptySeriesSet()
 	}
-	if len(sets) == 1 {
-		return sets[0]
-	}
-	// Sets need to be sorted. Both series.NewConcreteSeriesSet and newTimeSeriesSeriesSet take care of that.
-	return storage.NewMergeSeriesSet(sets, storage.ChainedSeriesMerge)
+
+	return series.NewConcreteSeriesSet(sortSeries, serieses)
 }
 
 func (q *distributorQuerier) LabelValues(ctx context.Context, name string, matchers ...*labels.Matcher) ([]string, annotations.Annotations, error) {
@@ -234,7 +207,7 @@ func (q *distributorQuerier) labelNamesWithMatchers(ctx context.Context, matcher
 	defer log.Span.Finish()
 
 	var (
-		ms  []metric.Metric
+		ms  []model.Metric
 		err error
 	)
 
@@ -250,7 +223,7 @@ func (q *distributorQuerier) labelNamesWithMatchers(ctx context.Context, matcher
 	namesMap := make(map[string]struct{})
 
 	for _, m := range ms {
-		for name := range m.Metric {
+		for name := range m {
 			namesMap[string(name)] = struct{}{}
 		}
 	}

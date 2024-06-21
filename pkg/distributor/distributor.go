@@ -29,7 +29,6 @@ import (
 	"github.com/cortexproject/cortex/pkg/cortexpb"
 	"github.com/cortexproject/cortex/pkg/ha"
 	ingester_client "github.com/cortexproject/cortex/pkg/ingester/client"
-	"github.com/cortexproject/cortex/pkg/prom1/storage/metric"
 	"github.com/cortexproject/cortex/pkg/ring"
 	ring_client "github.com/cortexproject/cortex/pkg/ring/client"
 	"github.com/cortexproject/cortex/pkg/tenant"
@@ -65,9 +64,14 @@ const (
 
 	instanceIngestionRateTickInterval = time.Second
 
+	clearStaleIngesterMetricsInterval = time.Minute
+
 	// mergeSlicesParallelism is a constant of how much go routines we should use to merge slices, and
 	// it was based on empirical observation: See BenchmarkMergeSlicesParallel
 	mergeSlicesParallelism = 8
+
+	sampleMetricTypeFloat     = "float"
+	sampleMetricTypeHistogram = "histogram"
 )
 
 // Distributor is a storage.SampleAppender and a client.Querier which
@@ -118,6 +122,8 @@ type Distributor struct {
 	ingesterQueryFailures            *prometheus.CounterVec
 	replicationFactor                prometheus.Gauge
 	latestSeenSampleTimestampPerUser *prometheus.GaugeVec
+
+	validateMetrics *validation.ValidateMetrics
 }
 
 // Config contains the configuration required to
@@ -273,7 +279,7 @@ func New(cfg Config, clientConfig ingester_client.Config, limits *validation.Ove
 			Namespace: "cortex",
 			Name:      "distributor_received_samples_total",
 			Help:      "The total number of received samples, excluding rejected and deduped samples.",
-		}, []string{"user"}),
+		}, []string{"user", "type"}),
 		receivedExemplars: promauto.With(reg).NewCounterVec(prometheus.CounterOpts{
 			Namespace: "cortex",
 			Name:      "distributor_received_exemplars_total",
@@ -288,7 +294,7 @@ func New(cfg Config, clientConfig ingester_client.Config, limits *validation.Ove
 			Namespace: "cortex",
 			Name:      "distributor_samples_in_total",
 			Help:      "The total number of samples that have come in to the distributor, including rejected or deduped samples.",
-		}, []string{"user"}),
+		}, []string{"user", "type"}),
 		incomingExemplars: promauto.With(reg).NewCounterVec(prometheus.CounterOpts{
 			Namespace: "cortex",
 			Name:      "distributor_exemplars_in_total",
@@ -344,6 +350,8 @@ func New(cfg Config, clientConfig ingester_client.Config, limits *validation.Ove
 			Name: "cortex_distributor_latest_seen_sample_timestamp_seconds",
 			Help: "Unix timestamp of latest received sample per user.",
 		}, []string{"user"}),
+
+		validateMetrics: validation.NewValidateMetrics(reg),
 	}
 
 	promauto.With(reg).NewGauge(prometheus.GaugeOpts{
@@ -398,6 +406,9 @@ func (d *Distributor) running(ctx context.Context) error {
 	ingestionRateTicker := time.NewTicker(instanceIngestionRateTickInterval)
 	defer ingestionRateTicker.Stop()
 
+	staleIngesterMetricTicker := time.NewTicker(clearStaleIngesterMetricsInterval)
+	defer staleIngesterMetricTicker.Stop()
+
 	for {
 		select {
 		case <-ctx.Done():
@@ -405,6 +416,9 @@ func (d *Distributor) running(ctx context.Context) error {
 
 		case <-ingestionRateTicker.C:
 			d.ingestionRate.Tick()
+
+		case <-staleIngesterMetricTicker.C:
+			d.cleanStaleIngesterMetrics()
 
 		case err := <-d.subservicesWatcher.Chan():
 			return errors.Wrap(err, "distributor subservice failed")
@@ -417,10 +431,12 @@ func (d *Distributor) cleanupInactiveUser(userID string) {
 
 	d.HATracker.CleanupHATrackerMetricsForUser(userID)
 
-	d.receivedSamples.DeleteLabelValues(userID)
+	d.receivedSamples.DeleteLabelValues(userID, sampleMetricTypeFloat)
+	d.receivedSamples.DeleteLabelValues(userID, sampleMetricTypeHistogram)
 	d.receivedExemplars.DeleteLabelValues(userID)
 	d.receivedMetadata.DeleteLabelValues(userID)
-	d.incomingSamples.DeleteLabelValues(userID)
+	d.incomingSamples.DeleteLabelValues(userID, sampleMetricTypeFloat)
+	d.incomingSamples.DeleteLabelValues(userID, sampleMetricTypeHistogram)
 	d.incomingExemplars.DeleteLabelValues(userID)
 	d.incomingMetadata.DeleteLabelValues(userID)
 	d.nonHASamples.DeleteLabelValues(userID)
@@ -430,7 +446,7 @@ func (d *Distributor) cleanupInactiveUser(userID string) {
 		level.Warn(d.log).Log("msg", "failed to remove cortex_distributor_deduped_samples_total metric for user", "user", userID, "err", err)
 	}
 
-	validation.DeletePerUserValidationMetrics(userID, d.log)
+	validation.DeletePerUserValidationMetrics(d.validateMetrics, userID, d.log)
 }
 
 // Called after distributor is asked to stop via StopAsync.
@@ -527,7 +543,7 @@ func (d *Distributor) checkSample(ctx context.Context, userID, cluster, replica 
 func (d *Distributor) validateSeries(ts cortexpb.PreallocTimeseries, userID string, skipLabelNameValidation bool, limits *validation.Limits) (cortexpb.PreallocTimeseries, validation.ValidationError) {
 	d.labelsHistogram.Observe(float64(len(ts.Labels)))
 
-	if err := validation.ValidateLabels(limits, userID, ts.Labels, skipLabelNameValidation); err != nil {
+	if err := validation.ValidateLabels(d.validateMetrics, limits, userID, ts.Labels, skipLabelNameValidation); err != nil {
 		return emptyPreallocSeries, err
 	}
 
@@ -536,7 +552,7 @@ func (d *Distributor) validateSeries(ts cortexpb.PreallocTimeseries, userID stri
 		// Only alloc when data present
 		samples = make([]cortexpb.Sample, 0, len(ts.Samples))
 		for _, s := range ts.Samples {
-			if err := validation.ValidateSample(limits, userID, ts.Labels, s); err != nil {
+			if err := validation.ValidateSampleTimestamp(d.validateMetrics, limits, userID, ts.Labels, s.TimestampMs); err != nil {
 				return emptyPreallocSeries, err
 			}
 			samples = append(samples, s)
@@ -548,7 +564,7 @@ func (d *Distributor) validateSeries(ts cortexpb.PreallocTimeseries, userID stri
 		// Only alloc when data present
 		exemplars = make([]cortexpb.Exemplar, 0, len(ts.Exemplars))
 		for _, e := range ts.Exemplars {
-			if err := validation.ValidateExemplar(userID, ts.Labels, e); err != nil {
+			if err := validation.ValidateExemplar(d.validateMetrics, userID, ts.Labels, e); err != nil {
 				// An exemplar validation error prevents ingesting samples
 				// in the same series object. However, because the current Prometheus
 				// remote write implementation only populates one or the other,
@@ -563,8 +579,13 @@ func (d *Distributor) validateSeries(ts cortexpb.PreallocTimeseries, userID stri
 	if len(ts.Histograms) > 0 {
 		// Only alloc when data present
 		histograms = make([]cortexpb.Histogram, 0, len(ts.Histograms))
-		// TODO(yeya24): we need to have validations for native histograms
-		// at some point. Skip validations for now.
+		for _, h := range ts.Histograms {
+			// TODO(yeya24): add other validations for native histogram.
+			// For example, Prometheus scrape has bucket limit and schema check.
+			if err := validation.ValidateSampleTimestamp(d.validateMetrics, limits, userID, ts.Labels, h.TimestampMs); err != nil {
+				return emptyPreallocSeries, err
+			}
+		}
 		histograms = append(histograms, ts.Histograms...)
 	}
 
@@ -596,14 +617,17 @@ func (d *Distributor) Push(ctx context.Context, req *cortexpb.WriteRequest) (*co
 	now := time.Now()
 	d.activeUsers.UpdateUserTimestamp(userID, now)
 
-	numSamples := 0
+	numFloatSamples := 0
+	numHistogramSamples := 0
 	numExemplars := 0
 	for _, ts := range req.Timeseries {
-		numSamples += len(ts.Samples) + len(ts.Histograms)
+		numFloatSamples += len(ts.Samples)
+		numHistogramSamples += len(ts.Histograms)
 		numExemplars += len(ts.Exemplars)
 	}
 	// Count the total samples, exemplars in, prior to validation or deduplication, for comparison with other metrics.
-	d.incomingSamples.WithLabelValues(userID).Add(float64(numSamples))
+	d.incomingSamples.WithLabelValues(userID, sampleMetricTypeFloat).Add(float64(numFloatSamples))
+	d.incomingSamples.WithLabelValues(userID, sampleMetricTypeHistogram).Add(float64(numFloatSamples))
 	d.incomingExemplars.WithLabelValues(userID).Add(float64(numExemplars))
 	// Count the total number of metadata in.
 	d.incomingMetadata.WithLabelValues(userID).Add(float64(len(req.Metadata)))
@@ -631,12 +655,12 @@ func (d *Distributor) Push(ctx context.Context, req *cortexpb.WriteRequest) (*co
 
 			if errors.Is(err, ha.ReplicasNotMatchError{}) {
 				// These samples have been deduped.
-				d.dedupedSamples.WithLabelValues(userID, cluster).Add(float64(numSamples))
+				d.dedupedSamples.WithLabelValues(userID, cluster).Add(float64(numFloatSamples + numHistogramSamples))
 				return nil, httpgrpc.Errorf(http.StatusAccepted, err.Error())
 			}
 
 			if errors.Is(err, ha.TooManyReplicaGroupsError{}) {
-				validation.DiscardedSamples.WithLabelValues(validation.TooManyHAClusters, userID).Add(float64(numSamples))
+				d.validateMetrics.DiscardedSamples.WithLabelValues(validation.TooManyHAClusters, userID).Add(float64(numFloatSamples + numHistogramSamples))
 				return nil, httpgrpc.Errorf(http.StatusBadRequest, err.Error())
 			}
 
@@ -644,18 +668,19 @@ func (d *Distributor) Push(ctx context.Context, req *cortexpb.WriteRequest) (*co
 		}
 		// If there wasn't an error but removeReplica is false that means we didn't find both HA labels.
 		if !removeReplica {
-			d.nonHASamples.WithLabelValues(userID).Add(float64(numSamples))
+			d.nonHASamples.WithLabelValues(userID).Add(float64(numFloatSamples + numHistogramSamples))
 		}
 	}
 
 	// A WriteRequest can only contain series or metadata but not both. This might change in the future.
-	seriesKeys, validatedTimeseries, validatedSamples, validatedExemplars, firstPartialErr, err := d.prepareSeriesKeys(ctx, req, userID, limits, removeReplica)
+	seriesKeys, validatedTimeseries, validatedFloatSamples, validatedHistogramSamples, validatedExemplars, firstPartialErr, err := d.prepareSeriesKeys(ctx, req, userID, limits, removeReplica)
 	if err != nil {
 		return nil, err
 	}
 	metadataKeys, validatedMetadata, firstPartialErr := d.prepareMetadataKeys(req, limits, userID, firstPartialErr)
 
-	d.receivedSamples.WithLabelValues(userID).Add(float64(validatedSamples))
+	d.receivedSamples.WithLabelValues(userID, sampleMetricTypeFloat).Add(float64(validatedFloatSamples))
+	d.receivedSamples.WithLabelValues(userID, sampleMetricTypeHistogram).Add(float64(validatedHistogramSamples))
 	d.receivedExemplars.WithLabelValues(userID).Add(float64(validatedExemplars))
 	d.receivedMetadata.WithLabelValues(userID).Add(float64(len(validatedMetadata)))
 
@@ -666,18 +691,19 @@ func (d *Distributor) Push(ctx context.Context, req *cortexpb.WriteRequest) (*co
 		return &cortexpb.WriteResponse{}, firstPartialErr
 	}
 
-	totalN := validatedSamples + validatedExemplars + len(validatedMetadata)
+	totalSamples := validatedFloatSamples + validatedHistogramSamples
+	totalN := totalSamples + validatedExemplars + len(validatedMetadata)
 	if !d.ingestionRateLimiter.AllowN(now, userID, totalN) {
 		// Ensure the request slice is reused if the request is rate limited.
 		cortexpb.ReuseSlice(req.Timeseries)
 
-		validation.DiscardedSamples.WithLabelValues(validation.RateLimited, userID).Add(float64(validatedSamples))
-		validation.DiscardedExemplars.WithLabelValues(validation.RateLimited, userID).Add(float64(validatedExemplars))
-		validation.DiscardedMetadata.WithLabelValues(validation.RateLimited, userID).Add(float64(len(validatedMetadata)))
+		d.validateMetrics.DiscardedSamples.WithLabelValues(validation.RateLimited, userID).Add(float64(totalSamples))
+		d.validateMetrics.DiscardedExemplars.WithLabelValues(validation.RateLimited, userID).Add(float64(validatedExemplars))
+		d.validateMetrics.DiscardedMetadata.WithLabelValues(validation.RateLimited, userID).Add(float64(len(validatedMetadata)))
 		// Return a 429 here to tell the client it is going too fast.
 		// Client may discard the data or slow down and re-send.
 		// Prometheus v2.26 added a remote-write option 'retry_on_http_429'.
-		return nil, httpgrpc.Errorf(http.StatusTooManyRequests, "ingestion rate limit (%v) exceeded while adding %d samples and %d metadata", d.ingestionRateLimiter.Limit(now, userID), validatedSamples, len(validatedMetadata))
+		return nil, httpgrpc.Errorf(http.StatusTooManyRequests, "ingestion rate limit (%v) exceeded while adding %d samples and %d metadata", d.ingestionRateLimiter.Limit(now, userID), totalSamples, len(validatedMetadata))
 	}
 
 	// totalN included samples and metadata. Ingester follows this pattern when computing its ingestion rate.
@@ -699,6 +725,41 @@ func (d *Distributor) Push(ctx context.Context, req *cortexpb.WriteRequest) (*co
 	}
 
 	return &cortexpb.WriteResponse{}, firstPartialErr
+}
+
+func (d *Distributor) cleanStaleIngesterMetrics() {
+	healthy, unhealthy, err := d.ingestersRing.GetAllInstanceDescs(ring.WriteNoExtend)
+	if err != nil {
+		level.Warn(d.log).Log("msg", "error cleaning metrics: GetAllInstanceDescs", "err", err)
+		return
+	}
+
+	ipsMap := map[string]struct{}{}
+
+	for _, ing := range append(healthy, unhealthy...) {
+		ipsMap[ing.Addr] = struct{}{}
+	}
+
+	ingesterMetrics := []*prometheus.CounterVec{d.ingesterAppends, d.ingesterAppendFailures, d.ingesterQueries, d.ingesterQueryFailures}
+
+	for _, m := range ingesterMetrics {
+		metrics, err := util.GetLabels(m, make(map[string]string))
+
+		if err != nil {
+			level.Warn(d.log).Log("msg", "error cleaning metrics: GetLabels", "err", err)
+			return
+		}
+
+		for _, lbls := range metrics {
+			if _, ok := ipsMap[lbls.Get("ingester")]; !ok {
+				err := util.DeleteMatchingLabels(m, map[string]string{"ingester": lbls.Get("ingester")})
+				if err != nil {
+					level.Warn(d.log).Log("msg", "error cleaning metrics: DeleteMatchingLabels", "err", err)
+					return
+				}
+			}
+		}
+	}
 }
 
 func (d *Distributor) doBatch(ctx context.Context, req *cortexpb.WriteRequest, subRing ring.ReadRing, keys []uint32, initialMetadataIndex int, validatedMetadata []*cortexpb.MetricMetadata, validatedTimeseries []cortexpb.PreallocTimeseries, userID string) error {
@@ -748,7 +809,7 @@ func (d *Distributor) prepareMetadataKeys(req *cortexpb.WriteRequest, limits *va
 	metadataKeys := make([]uint32, 0, len(req.Metadata))
 
 	for _, m := range req.Metadata {
-		err := validation.ValidateMetadata(limits, userID, m)
+		err := validation.ValidateMetadata(d.validateMetrics, limits, userID, m)
 
 		if err != nil {
 			if firstPartialErr == nil {
@@ -764,7 +825,7 @@ func (d *Distributor) prepareMetadataKeys(req *cortexpb.WriteRequest, limits *va
 	return metadataKeys, validatedMetadata, firstPartialErr
 }
 
-func (d *Distributor) prepareSeriesKeys(ctx context.Context, req *cortexpb.WriteRequest, userID string, limits *validation.Limits, removeReplica bool) ([]uint32, []cortexpb.PreallocTimeseries, int, int, error, error) {
+func (d *Distributor) prepareSeriesKeys(ctx context.Context, req *cortexpb.WriteRequest, userID string, limits *validation.Limits, removeReplica bool) ([]uint32, []cortexpb.PreallocTimeseries, int, int, int, error, error) {
 	pSpan, _ := opentracing.StartSpanFromContext(ctx, "prepareSeriesKeys")
 	defer pSpan.Finish()
 
@@ -772,7 +833,8 @@ func (d *Distributor) prepareSeriesKeys(ctx context.Context, req *cortexpb.Write
 	// check each sample/metadata and discard if outside limits.
 	validatedTimeseries := make([]cortexpb.PreallocTimeseries, 0, len(req.Timeseries))
 	seriesKeys := make([]uint32, 0, len(req.Timeseries))
-	validatedSamples := 0
+	validatedFloatSamples := 0
+	validatedHistogramSamples := 0
 	validatedExemplars := 0
 
 	var firstPartialErr error
@@ -793,13 +855,15 @@ func (d *Distributor) prepareSeriesKeys(ctx context.Context, req *cortexpb.Write
 		if len(ts.Samples) > 0 {
 			latestSampleTimestampMs = max(latestSampleTimestampMs, ts.Samples[len(ts.Samples)-1].TimestampMs)
 		}
-		// TODO(yeya24): use timestamp of the latest native histogram in the series as well.
+		if len(ts.Histograms) > 0 {
+			latestSampleTimestampMs = max(latestSampleTimestampMs, ts.Histograms[len(ts.Histograms)-1].TimestampMs)
+		}
 
 		if mrc := limits.MetricRelabelConfigs; len(mrc) > 0 {
 			l, _ := relabel.Process(cortexpb.FromLabelAdaptersToLabels(ts.Labels), mrc...)
 			if len(l) == 0 {
 				// all labels are gone, samples will be discarded
-				validation.DiscardedSamples.WithLabelValues(
+				d.validateMetrics.DiscardedSamples.WithLabelValues(
 					validation.DroppedByRelabelConfiguration,
 					userID,
 				).Add(float64(len(ts.Samples)))
@@ -820,7 +884,7 @@ func (d *Distributor) prepareSeriesKeys(ctx context.Context, req *cortexpb.Write
 		}
 
 		if len(ts.Labels) == 0 {
-			validation.DiscardedExemplars.WithLabelValues(
+			d.validateMetrics.DiscardedExemplars.WithLabelValues(
 				validation.DroppedByUserConfigurationOverride,
 				userID,
 			).Add(float64(len(ts.Samples)))
@@ -839,7 +903,7 @@ func (d *Distributor) prepareSeriesKeys(ctx context.Context, req *cortexpb.Write
 		// label and dropped labels (if any)
 		key, err := d.tokenForLabels(userID, ts.Labels)
 		if err != nil {
-			return nil, nil, 0, 0, nil, err
+			return nil, nil, 0, 0, 0, nil, err
 		}
 		validatedSeries, validationErr := d.validateSeries(ts, userID, skipLabelNameValidation, limits)
 
@@ -858,11 +922,11 @@ func (d *Distributor) prepareSeriesKeys(ctx context.Context, req *cortexpb.Write
 
 		seriesKeys = append(seriesKeys, key)
 		validatedTimeseries = append(validatedTimeseries, validatedSeries)
-		// TODO(yeya24): add histogram samples as well when supported.
-		validatedSamples += len(ts.Samples)
+		validatedFloatSamples += len(ts.Samples)
+		validatedHistogramSamples += len(ts.Histograms)
 		validatedExemplars += len(ts.Exemplars)
 	}
-	return seriesKeys, validatedTimeseries, validatedSamples, validatedExemplars, firstPartialErr, nil
+	return seriesKeys, validatedTimeseries, validatedFloatSamples, validatedHistogramSamples, validatedExemplars, firstPartialErr, nil
 }
 
 func sortLabelsIfNeeded(labels []cortexpb.LabelAdapter) {
@@ -1094,7 +1158,7 @@ func (d *Distributor) LabelNames(ctx context.Context, from, to model.Time) ([]st
 }
 
 // MetricsForLabelMatchers gets the metrics that match said matchers
-func (d *Distributor) MetricsForLabelMatchers(ctx context.Context, from, through model.Time, matchers ...*labels.Matcher) ([]metric.Metric, error) {
+func (d *Distributor) MetricsForLabelMatchers(ctx context.Context, from, through model.Time, matchers ...*labels.Matcher) ([]model.Metric, error) {
 	return d.metricsForLabelMatchersCommon(ctx, from, through, func(ctx context.Context, rs ring.ReplicationSet, req *ingester_client.MetricsForLabelMatchersRequest, metrics *map[model.Fingerprint]model.Metric, mutex *sync.Mutex, queryLimiter *limiter.QueryLimiter) error {
 		_, err := d.ForReplicationSet(ctx, rs, false, func(ctx context.Context, client ingester_client.IngesterClient) (interface{}, error) {
 			resp, err := client.MetricsForLabelMatchers(ctx, req)
@@ -1123,7 +1187,7 @@ func (d *Distributor) MetricsForLabelMatchers(ctx context.Context, from, through
 	}, matchers...)
 }
 
-func (d *Distributor) MetricsForLabelMatchersStream(ctx context.Context, from, through model.Time, matchers ...*labels.Matcher) ([]metric.Metric, error) {
+func (d *Distributor) MetricsForLabelMatchersStream(ctx context.Context, from, through model.Time, matchers ...*labels.Matcher) ([]model.Metric, error) {
 	return d.metricsForLabelMatchersCommon(ctx, from, through, func(ctx context.Context, rs ring.ReplicationSet, req *ingester_client.MetricsForLabelMatchersRequest, metrics *map[model.Fingerprint]model.Metric, mutex *sync.Mutex, queryLimiter *limiter.QueryLimiter) error {
 		_, err := d.ForReplicationSet(ctx, rs, false, func(ctx context.Context, client ingester_client.IngesterClient) (interface{}, error) {
 			stream, err := client.MetricsForLabelMatchersStream(ctx, req)
@@ -1163,7 +1227,7 @@ func (d *Distributor) MetricsForLabelMatchersStream(ctx context.Context, from, t
 	}, matchers...)
 }
 
-func (d *Distributor) metricsForLabelMatchersCommon(ctx context.Context, from, through model.Time, f func(context.Context, ring.ReplicationSet, *ingester_client.MetricsForLabelMatchersRequest, *map[model.Fingerprint]model.Metric, *sync.Mutex, *limiter.QueryLimiter) error, matchers ...*labels.Matcher) ([]metric.Metric, error) {
+func (d *Distributor) metricsForLabelMatchersCommon(ctx context.Context, from, through model.Time, f func(context.Context, ring.ReplicationSet, *ingester_client.MetricsForLabelMatchersRequest, *map[model.Fingerprint]model.Metric, *sync.Mutex, *limiter.QueryLimiter) error, matchers ...*labels.Matcher) ([]model.Metric, error) {
 	replicationSet, err := d.GetIngestersForMetadata(ctx)
 	queryLimiter := limiter.QueryLimiterFromContextWithFallback(ctx)
 	if err != nil {
@@ -1184,11 +1248,9 @@ func (d *Distributor) metricsForLabelMatchersCommon(ctx context.Context, from, t
 	}
 
 	mutex.Lock()
-	result := make([]metric.Metric, 0, len(metrics))
+	result := make([]model.Metric, 0, len(metrics))
 	for _, m := range metrics {
-		result = append(result, metric.Metric{
-			Metric: m,
-		})
+		result = append(result, m)
 	}
 	mutex.Unlock()
 	return result, nil

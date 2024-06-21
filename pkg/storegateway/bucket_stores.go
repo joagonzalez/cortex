@@ -583,6 +583,9 @@ func (u *BucketStores) getOrCreateStore(userID string) (*store.BucketStore, erro
 	bucketStoreReg := prometheus.NewRegistry()
 	bucketStoreOpts := []store.BucketStoreOption{
 		store.WithLogger(userLogger),
+		store.WithRequestLoggerFunc(func(ctx context.Context, logger log.Logger) log.Logger {
+			return util_log.HeadersFromContext(ctx, logger)
+		}),
 		store.WithRegistry(bucketStoreReg),
 		store.WithIndexCache(u.indexCache),
 		store.WithQueryGate(u.queryGate),
@@ -733,6 +736,10 @@ type limiter struct {
 }
 
 func (c *limiter) Reserve(num uint64) error {
+	return c.ReserveWithType(num, 0)
+}
+
+func (c *limiter) ReserveWithType(num uint64, _ store.StoreDataType) error {
 	err := c.limiter.Reserve(num)
 	if err != nil {
 		return httpgrpc.Errorf(http.StatusUnprocessableEntity, err.Error())

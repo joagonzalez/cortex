@@ -29,9 +29,7 @@ import (
 	promchunk "github.com/cortexproject/cortex/pkg/chunk/encoding"
 	"github.com/cortexproject/cortex/pkg/cortexpb"
 	"github.com/cortexproject/cortex/pkg/ingester/client"
-	"github.com/cortexproject/cortex/pkg/prom1/storage/metric"
 	"github.com/cortexproject/cortex/pkg/querier/batch"
-	"github.com/cortexproject/cortex/pkg/tenant"
 	"github.com/cortexproject/cortex/pkg/util"
 	"github.com/cortexproject/cortex/pkg/util/chunkcompat"
 	"github.com/cortexproject/cortex/pkg/util/flagext"
@@ -79,11 +77,10 @@ type query struct {
 }
 
 var (
-	encodings = []struct {
-		name string
-		e    promchunk.Encoding
-	}{
-		{"PrometheusXorChunk", promchunk.PrometheusXorChunk},
+	encodings = []promchunk.Encoding{
+		promchunk.PrometheusXorChunk,
+		promchunk.PrometheusHistogramChunk,
+		promchunk.PrometheusFloatHistogramChunk,
 	}
 
 	queries = []query{
@@ -170,30 +167,29 @@ func TestShouldSortSeriesIfQueryingMultipleQueryables(t *testing.T) {
 	}
 
 	db, samples := mockTSDB(t, labelsSets, model.Time(start.Unix()*1000), int(chunks*samplesPerChunk), sampleRate, chunkOffset, int(samplesPerChunk))
-
 	distributor := &MockDistributor{}
 
 	unorderedResponse := client.QueryStreamResponse{
-		Timeseries: []cortexpb.TimeSeries{
+		Chunkseries: []client.TimeSeriesChunk{
 			{
 				Labels: []cortexpb.LabelAdapter{
 					{Name: model.MetricNameLabel, Value: "foo"},
 					{Name: "order", Value: "2"},
 				},
-				Samples: samples,
+				Chunks: ConvertToChunks(t, samples, nil),
 			},
 			{
 				Labels: []cortexpb.LabelAdapter{
 					{Name: model.MetricNameLabel, Value: "foo"},
 					{Name: "order", Value: "1"},
 				},
-				Samples: samples,
+				Chunks: ConvertToChunks(t, samples, nil),
 			},
 		},
 	}
 
 	distributor.On("QueryStream", mock.Anything, mock.Anything, mock.Anything, mock.Anything).Return(&unorderedResponse, nil)
-	distributorQueryable := newDistributorQueryable(distributor, cfg.IngesterMetadataStreaming, batch.NewChunkMergeIterator, cfg.QueryIngestersWithin, cfg.QueryStoreForLabels)
+	distributorQueryable := newDistributorQueryable(distributor, cfg.IngesterMetadataStreaming, batch.NewChunkMergeIterator, cfg.QueryIngestersWithin)
 
 	tCases := []struct {
 		name                 string
@@ -323,41 +319,41 @@ func TestLimits(t *testing.T) {
 	_, samples := mockTSDB(t, labelsSets, model.Time(start.Unix()*1000), int(chunks*samplesPerChunk), sampleRate, chunkOffset, int(samplesPerChunk))
 
 	streamResponse := client.QueryStreamResponse{
-		Timeseries: []cortexpb.TimeSeries{
+		Chunkseries: []client.TimeSeriesChunk{
 			{
 				Labels: []cortexpb.LabelAdapter{
 					{Name: model.MetricNameLabel, Value: "foo"},
 					{Name: "order", Value: "2"},
 				},
-				Samples: samples,
+				Chunks: ConvertToChunks(t, samples, nil),
 			},
 			{
 				Labels: []cortexpb.LabelAdapter{
 					{Name: model.MetricNameLabel, Value: "foo"},
 					{Name: "order", Value: "1"},
 				},
-				Samples: samples,
+				Chunks: ConvertToChunks(t, samples, nil),
 			},
 			{
 				Labels: []cortexpb.LabelAdapter{
 					{Name: model.MetricNameLabel, Value: "foo"},
 					{Name: "orders", Value: "3"},
 				},
-				Samples: samples,
+				Chunks: ConvertToChunks(t, samples, nil),
 			},
 			{
 				Labels: []cortexpb.LabelAdapter{
 					{Name: model.MetricNameLabel, Value: "bar"},
 					{Name: "orders", Value: "2"},
 				},
-				Samples: samples,
+				Chunks: ConvertToChunks(t, samples, nil),
 			},
 			{
 				Labels: []cortexpb.LabelAdapter{
 					{Name: model.MetricNameLabel, Value: "bar"},
 					{Name: "orders", Value: "1"},
 				},
-				Samples: samples,
+				Chunks: ConvertToChunks(t, samples, nil),
 			},
 		},
 	}
@@ -366,7 +362,7 @@ func TestLimits(t *testing.T) {
 		response: &streamResponse,
 	}
 
-	distributorQueryableStreaming := newDistributorQueryable(distributor, cfg.IngesterMetadataStreaming, batch.NewChunkMergeIterator, cfg.QueryIngestersWithin, cfg.QueryStoreForLabels)
+	distributorQueryableStreaming := newDistributorQueryable(distributor, cfg.IngesterMetadataStreaming, batch.NewChunkMergeIterator, cfg.QueryIngestersWithin)
 
 	tCases := []struct {
 		name                 string
@@ -484,31 +480,29 @@ func TestQuerier(t *testing.T) {
 	}
 	for _, thanosEngine := range []bool{false, true} {
 		for _, query := range queries {
-			for _, encoding := range encodings {
-				t.Run(fmt.Sprintf("%s/%s", query.query, encoding.name), func(t *testing.T) {
-					var queryEngine promql.QueryEngine
-					if thanosEngine {
-						queryEngine = engine.New(engine.Opts{
-							EngineOpts:        opts,
-							LogicalOptimizers: logicalplan.AllOptimizers,
-						})
-					} else {
-						queryEngine = promql.NewEngine(opts)
-					}
-					// Disable active query tracker to avoid mmap error.
-					cfg.ActiveQueryTrackerDir = ""
+			t.Run(fmt.Sprintf("thanosEngine=%s,query=%s", strconv.FormatBool(thanosEngine), query.query), func(t *testing.T) {
+				var queryEngine promql.QueryEngine
+				if thanosEngine {
+					queryEngine = engine.New(engine.Opts{
+						EngineOpts:        opts,
+						LogicalOptimizers: logicalplan.AllOptimizers,
+					})
+				} else {
+					queryEngine = promql.NewEngine(opts)
+				}
+				// Disable active query tracker to avoid mmap error.
+				cfg.ActiveQueryTrackerDir = ""
 
-					chunkStore, through := makeMockChunkStore(t, chunks, encoding.e)
-					distributor := mockDistibutorFor(t, chunkStore.chunks)
+				chunkStore, through := makeMockChunkStore(t, chunks, promchunk.PrometheusXorChunk)
+				distributor := mockDistibutorFor(t, chunkStore.chunks)
 
-					overrides, err := validation.NewOverrides(DefaultLimitsConfig(), nil)
-					require.NoError(t, err)
+				overrides, err := validation.NewOverrides(DefaultLimitsConfig(), nil)
+				require.NoError(t, err)
 
-					queryables := []QueryableWithFilter{UseAlwaysQueryable(NewMockStoreQueryable(cfg, chunkStore)), UseAlwaysQueryable(db)}
-					queryable, _, _ := New(cfg, overrides, distributor, queryables, nil, log.NewNopLogger())
-					testRangeQuery(t, queryable, queryEngine, through, query)
-				})
-			}
+				queryables := []QueryableWithFilter{UseAlwaysQueryable(NewMockStoreQueryable(cfg, chunkStore)), UseAlwaysQueryable(db)}
+				queryable, _, _ := New(cfg, overrides, distributor, queryables, nil, log.NewNopLogger())
+				testRangeQuery(t, queryable, queryEngine, through, query)
+			})
 		}
 	}
 }
@@ -630,47 +624,49 @@ func TestNoHistoricalQueryToIngester(t *testing.T) {
 	// Disable active query tracker to avoid mmap error.
 	cfg.ActiveQueryTrackerDir = ""
 	for _, thanosEngine := range []bool{true, false} {
-		for _, c := range testCases {
-			cfg.QueryIngestersWithin = c.queryIngestersWithin
-			t.Run(fmt.Sprintf("thanosEngine=%t,queryIngestersWithin=%v, test=%s", thanosEngine, c.queryIngestersWithin, c.name), func(t *testing.T) {
-				var queryEngine promql.QueryEngine
-				if thanosEngine {
-					queryEngine = engine.New(engine.Opts{
-						EngineOpts:        opts,
-						LogicalOptimizers: logicalplan.AllOptimizers,
-					})
-				} else {
-					queryEngine = promql.NewEngine(opts)
-				}
-
-				chunkStore, _ := makeMockChunkStore(t, 24, encodings[0].e)
-				distributor := &errDistributor{}
-
-				overrides, err := validation.NewOverrides(DefaultLimitsConfig(), nil)
-				require.NoError(t, err)
-
-				ctx := user.InjectOrgID(context.Background(), "0")
-				queryable, _, _ := New(cfg, overrides, distributor, []QueryableWithFilter{UseAlwaysQueryable(NewMockStoreQueryable(cfg, chunkStore))}, nil, log.NewNopLogger())
-				query, err := queryEngine.NewRangeQuery(ctx, queryable, nil, "dummy", c.mint, c.maxt, 1*time.Minute)
-				require.NoError(t, err)
-
-				r := query.Exec(ctx)
-				_, err = r.Matrix()
-
-				if c.hitIngester {
-					// If the ingester was hit, the distributor always returns errDistributorError. Prometheus
-					// wrap any Select() error into "expanding series", so we do wrap it as well to have a match.
-					require.Error(t, err)
-					if !thanosEngine {
-						require.Equal(t, errors.Wrap(errDistributorError, "expanding series").Error(), err.Error())
+		for _, encoding := range encodings {
+			for _, c := range testCases {
+				cfg.QueryIngestersWithin = c.queryIngestersWithin
+				t.Run(fmt.Sprintf("thanosEngine=%t,encoding=%s,queryIngestersWithin=%v, test=%s", thanosEngine, encoding.String(), c.queryIngestersWithin, c.name), func(t *testing.T) {
+					var queryEngine promql.QueryEngine
+					if thanosEngine {
+						queryEngine = engine.New(engine.Opts{
+							EngineOpts:        opts,
+							LogicalOptimizers: logicalplan.AllOptimizers,
+						})
 					} else {
-						require.Equal(t, errDistributorError.Error(), err.Error())
+						queryEngine = promql.NewEngine(opts)
 					}
-				} else {
-					// If the ingester was hit, there would have been an error from errDistributor.
+
+					chunkStore, _ := makeMockChunkStore(t, 24, encoding)
+					distributor := &errDistributor{}
+
+					overrides, err := validation.NewOverrides(DefaultLimitsConfig(), nil)
 					require.NoError(t, err)
-				}
-			})
+
+					ctx := user.InjectOrgID(context.Background(), "0")
+					queryable, _, _ := New(cfg, overrides, distributor, []QueryableWithFilter{UseAlwaysQueryable(NewMockStoreQueryable(cfg, chunkStore))}, nil, log.NewNopLogger())
+					query, err := queryEngine.NewRangeQuery(ctx, queryable, nil, "dummy", c.mint, c.maxt, 1*time.Minute)
+					require.NoError(t, err)
+
+					r := query.Exec(ctx)
+					_, err = r.Matrix()
+
+					if c.hitIngester {
+						// If the ingester was hit, the distributor always returns errDistributorError. Prometheus
+						// wrap any Select() error into "expanding series", so we do wrap it as well to have a match.
+						require.Error(t, err)
+						if !thanosEngine {
+							require.Equal(t, errors.Wrap(errDistributorError, "expanding series").Error(), err.Error())
+						} else {
+							require.Equal(t, errDistributorError.Error(), err.Error())
+						}
+					} else {
+						// If the ingester was hit, there would have been an error from errDistributor.
+						require.NoError(t, err)
+					}
+				})
+			}
 		}
 	}
 }
@@ -735,7 +731,6 @@ func TestQuerier_ValidateQueryTimeRange_MaxQueryIntoFuture(t *testing.T) {
 		t.Run(name, func(t *testing.T) {
 			queryEngine := promql.NewEngine(opts)
 
-			// We don't need to query any data for this test, so an empty store is fine.
 			chunkStore := &emptyChunkStore{}
 			distributor := &MockDistributor{}
 			distributor.On("QueryStream", mock.Anything, mock.Anything, mock.Anything, mock.Anything).Return(&client.QueryStreamResponse{}, nil)
@@ -835,7 +830,6 @@ func TestQuerier_ValidateQueryTimeRange_MaxQueryLength(t *testing.T) {
 			overrides, err := validation.NewOverrides(limits, nil)
 			require.NoError(t, err)
 
-			// We don't need to query any data for this test, so an empty store is fine.
 			chunkStore := &emptyChunkStore{}
 			distributor := &emptyDistributor{}
 
@@ -973,7 +967,6 @@ func TestQuerier_ValidateQueryTimeRange_MaxQueryLookback(t *testing.T) {
 				overrides, err := validation.NewOverrides(limits, nil)
 				require.NoError(t, err)
 
-				// We don't need to query any data for this test, so an empty store is fine.
 				chunkStore := &emptyChunkStore{}
 				queryables := []QueryableWithFilter{UseAlwaysQueryable(NewMockStoreQueryable(cfg, chunkStore))}
 
@@ -1010,8 +1003,8 @@ func TestQuerier_ValidateQueryTimeRange_MaxQueryLookback(t *testing.T) {
 
 				t.Run("series", func(t *testing.T) {
 					distributor := &MockDistributor{}
-					distributor.On("MetricsForLabelMatchers", mock.Anything, mock.Anything, mock.Anything, mock.Anything).Return([]metric.Metric{}, nil)
-					distributor.On("MetricsForLabelMatchersStream", mock.Anything, mock.Anything, mock.Anything, mock.Anything).Return([]metric.Metric{}, nil)
+					distributor.On("MetricsForLabelMatchers", mock.Anything, mock.Anything, mock.Anything, mock.Anything).Return([]model.Metric{}, nil)
+					distributor.On("MetricsForLabelMatchersStream", mock.Anything, mock.Anything, mock.Anything, mock.Anything).Return([]model.Metric{}, nil)
 
 					queryable, _, _ := New(cfg, overrides, distributor, queryables, nil, log.NewNopLogger())
 					q, err := queryable.Querier(util.TimeToMillis(testData.queryStartTime), util.TimeToMillis(testData.queryEndTime))
@@ -1079,8 +1072,8 @@ func TestQuerier_ValidateQueryTimeRange_MaxQueryLookback(t *testing.T) {
 						labels.MustNewMatcher(labels.MatchNotEqual, "route", "get_user"),
 					}
 					distributor := &MockDistributor{}
-					distributor.On("MetricsForLabelMatchers", mock.Anything, mock.Anything, mock.Anything, matchers).Return([]metric.Metric{}, nil)
-					distributor.On("MetricsForLabelMatchersStream", mock.Anything, mock.Anything, mock.Anything, matchers).Return([]metric.Metric{}, nil)
+					distributor.On("MetricsForLabelMatchers", mock.Anything, mock.Anything, mock.Anything, matchers).Return([]model.Metric{}, nil)
+					distributor.On("MetricsForLabelMatchersStream", mock.Anything, mock.Anything, mock.Anything, matchers).Return([]model.Metric{}, nil)
 
 					queryable, _, _ := New(cfg, overrides, distributor, queryables, nil, log.NewNopLogger())
 					q, err := queryable.Querier(util.TimeToMillis(testData.queryStartTime), util.TimeToMillis(testData.queryEndTime))
@@ -1254,10 +1247,10 @@ func (m *errDistributor) LabelNames(context.Context, model.Time, model.Time) ([]
 func (m *errDistributor) LabelNamesStream(context.Context, model.Time, model.Time) ([]string, error) {
 	return nil, errDistributorError
 }
-func (m *errDistributor) MetricsForLabelMatchers(ctx context.Context, from, through model.Time, matchers ...*labels.Matcher) ([]metric.Metric, error) {
+func (m *errDistributor) MetricsForLabelMatchers(ctx context.Context, from, through model.Time, matchers ...*labels.Matcher) ([]model.Metric, error) {
 	return nil, errDistributorError
 }
-func (m *errDistributor) MetricsForLabelMatchersStream(ctx context.Context, from, through model.Time, matchers ...*labels.Matcher) ([]metric.Metric, error) {
+func (m *errDistributor) MetricsForLabelMatchersStream(ctx context.Context, from, through model.Time, matchers ...*labels.Matcher) ([]model.Metric, error) {
 	return nil, errDistributorError
 }
 
@@ -1270,7 +1263,7 @@ type emptyChunkStore struct {
 	called bool
 }
 
-func (c *emptyChunkStore) Get(ctx context.Context, userID string, from, through model.Time, matchers ...*labels.Matcher) ([]chunk.Chunk, error) {
+func (c *emptyChunkStore) Get() ([]chunk.Chunk, error) {
 	c.Lock()
 	defer c.Unlock()
 	c.called = true
@@ -1309,11 +1302,11 @@ func (d *emptyDistributor) LabelNamesStream(context.Context, model.Time, model.T
 	return nil, nil
 }
 
-func (d *emptyDistributor) MetricsForLabelMatchers(ctx context.Context, from, through model.Time, matchers ...*labels.Matcher) ([]metric.Metric, error) {
+func (d *emptyDistributor) MetricsForLabelMatchers(ctx context.Context, from, through model.Time, matchers ...*labels.Matcher) ([]model.Metric, error) {
 	return nil, nil
 }
 
-func (d *emptyDistributor) MetricsForLabelMatchersStream(ctx context.Context, from, through model.Time, matchers ...*labels.Matcher) ([]metric.Metric, error) {
+func (d *emptyDistributor) MetricsForLabelMatchersStream(ctx context.Context, from, through model.Time, matchers ...*labels.Matcher) ([]model.Metric, error) {
 	return nil, nil
 }
 
@@ -1322,7 +1315,7 @@ func (d *emptyDistributor) MetricsMetadata(ctx context.Context) ([]scrape.Metric
 }
 
 type mockStore interface {
-	Get(ctx context.Context, userID string, from, through model.Time, matchers ...*labels.Matcher) ([]chunk.Chunk, error)
+	Get() ([]chunk.Chunk, error)
 }
 
 // NewMockStoreQueryable returns the storage.Queryable implementation against the chunks store.
@@ -1350,16 +1343,6 @@ type mockStoreQuerier struct {
 // Select implements storage.Querier interface.
 // The bool passed is ignored because the series is always sorted.
 func (q *mockStoreQuerier) Select(ctx context.Context, _ bool, sp *storage.SelectHints, matchers ...*labels.Matcher) storage.SeriesSet {
-	userID, err := tenant.TenantID(ctx)
-	if err != nil {
-		return storage.ErrSeriesSet(err)
-	}
-
-	minT, maxT := q.mint, q.maxt
-	if sp != nil {
-		minT, maxT = sp.Start, sp.End
-	}
-
 	// We will hit this for /series lookup when -querier.query-store-for-labels-enabled is set.
 	// If we don't skip here, it'll make /series lookups extremely slow as all the chunks will be loaded.
 	// That flag is only to be set with blocks storage engine, and this is a protective measure.
@@ -1367,7 +1350,7 @@ func (q *mockStoreQuerier) Select(ctx context.Context, _ bool, sp *storage.Selec
 		return storage.EmptySeriesSet()
 	}
 
-	chunks, err := q.store.Get(ctx, userID, model.Time(minT), model.Time(maxT), matchers...)
+	chunks, err := q.store.Get()
 	if err != nil {
 		return storage.ErrSeriesSet(err)
 	}

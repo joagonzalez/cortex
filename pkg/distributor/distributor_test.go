@@ -1,7 +1,6 @@
 package distributor
 
 import (
-	"bytes"
 	"context"
 	"fmt"
 	"io"
@@ -23,6 +22,7 @@ import (
 	"github.com/prometheus/common/model"
 	"github.com/prometheus/prometheus/model/labels"
 	"github.com/prometheus/prometheus/model/relabel"
+	"github.com/prometheus/prometheus/tsdb/chunkenc"
 	"github.com/stretchr/testify/assert"
 	"github.com/stretchr/testify/require"
 	"github.com/weaveworks/common/httpgrpc"
@@ -32,12 +32,11 @@ import (
 	"google.golang.org/grpc/health/grpc_health_v1"
 	"google.golang.org/grpc/status"
 
-	"github.com/cortexproject/cortex/pkg/chunk/encoding"
+	promchunk "github.com/cortexproject/cortex/pkg/chunk/encoding"
 	"github.com/cortexproject/cortex/pkg/cortexpb"
 	"github.com/cortexproject/cortex/pkg/ha"
 	"github.com/cortexproject/cortex/pkg/ingester"
 	"github.com/cortexproject/cortex/pkg/ingester/client"
-	"github.com/cortexproject/cortex/pkg/prom1/storage/metric"
 	"github.com/cortexproject/cortex/pkg/ring"
 	ring_client "github.com/cortexproject/cortex/pkg/ring/client"
 	"github.com/cortexproject/cortex/pkg/ring/kv"
@@ -46,6 +45,7 @@ import (
 	"github.com/cortexproject/cortex/pkg/util"
 	"github.com/cortexproject/cortex/pkg/util/chunkcompat"
 	"github.com/cortexproject/cortex/pkg/util/flagext"
+	histogram_util "github.com/cortexproject/cortex/pkg/util/histogram"
 	"github.com/cortexproject/cortex/pkg/util/limiter"
 	"github.com/cortexproject/cortex/pkg/util/services"
 	"github.com/cortexproject/cortex/pkg/util/test"
@@ -318,8 +318,10 @@ func TestDistributor_Push(t *testing.T) {
 
 func TestDistributor_MetricsCleanup(t *testing.T) {
 	t.Parallel()
-	dists, _, regs, _ := prepare(t, prepConfig{
+	dists, _, regs, r := prepare(t, prepConfig{
 		numDistributors: 1,
+		numIngesters:    2,
+		happyIngesters:  2,
 	})
 	d := dists[0]
 	reg := regs[0]
@@ -334,20 +336,36 @@ func TestDistributor_MetricsCleanup(t *testing.T) {
 		"cortex_distributor_metadata_in_total",
 		"cortex_distributor_non_ha_samples_received_total",
 		"cortex_distributor_latest_seen_sample_timestamp_seconds",
+		"cortex_distributor_ingester_append_failures_total",
+		"cortex_distributor_ingester_appends_total",
+		"cortex_distributor_ingester_query_failures_total",
+		"cortex_distributor_ingester_queries_total",
 	}
 
-	d.receivedSamples.WithLabelValues("userA").Add(5)
-	d.receivedSamples.WithLabelValues("userB").Add(10)
+	d.receivedSamples.WithLabelValues("userA", sampleMetricTypeFloat).Add(5)
+	d.receivedSamples.WithLabelValues("userB", sampleMetricTypeFloat).Add(10)
+	d.receivedSamples.WithLabelValues("userC", sampleMetricTypeHistogram).Add(15)
 	d.receivedExemplars.WithLabelValues("userA").Add(5)
 	d.receivedExemplars.WithLabelValues("userB").Add(10)
 	d.receivedMetadata.WithLabelValues("userA").Add(5)
 	d.receivedMetadata.WithLabelValues("userB").Add(10)
-	d.incomingSamples.WithLabelValues("userA").Add(5)
+	d.incomingSamples.WithLabelValues("userA", sampleMetricTypeFloat).Add(5)
+	d.incomingSamples.WithLabelValues("userB", sampleMetricTypeHistogram).Add(6)
 	d.incomingExemplars.WithLabelValues("userA").Add(5)
 	d.incomingMetadata.WithLabelValues("userA").Add(5)
 	d.nonHASamples.WithLabelValues("userA").Add(5)
 	d.dedupedSamples.WithLabelValues("userA", "cluster1").Inc() // We cannot clean this metric
 	d.latestSeenSampleTimestampPerUser.WithLabelValues("userA").Set(1111)
+
+	h, _, _ := r.GetAllInstanceDescs(ring.WriteNoExtend)
+	d.ingesterAppends.WithLabelValues(h[0].Addr, typeMetadata).Inc()
+	d.ingesterAppendFailures.WithLabelValues(h[0].Addr, typeMetadata, "2xx").Inc()
+	d.ingesterAppends.WithLabelValues(h[1].Addr, typeMetadata).Inc()
+	d.ingesterAppendFailures.WithLabelValues(h[1].Addr, typeMetadata, "2xx").Inc()
+	d.ingesterQueries.WithLabelValues(h[0].Addr).Inc()
+	d.ingesterQueries.WithLabelValues(h[1].Addr).Inc()
+	d.ingesterQueryFailures.WithLabelValues(h[0].Addr).Inc()
+	d.ingesterQueryFailures.WithLabelValues(h[1].Addr).Inc()
 
 	require.NoError(t, testutil.GatherAndCompare(reg, strings.NewReader(`
 		# HELP cortex_distributor_deduped_samples_total The total number of deduplicated samples.
@@ -373,8 +391,9 @@ func TestDistributor_MetricsCleanup(t *testing.T) {
 
 		# HELP cortex_distributor_received_samples_total The total number of received samples, excluding rejected and deduped samples.
 		# TYPE cortex_distributor_received_samples_total counter
-		cortex_distributor_received_samples_total{user="userA"} 5
-		cortex_distributor_received_samples_total{user="userB"} 10
+		cortex_distributor_received_samples_total{type="float",user="userA"} 5
+		cortex_distributor_received_samples_total{type="float",user="userB"} 10
+		cortex_distributor_received_samples_total{type="histogram",user="userC"} 15
 
 		# HELP cortex_distributor_received_exemplars_total The total number of received exemplars, excluding rejected and deduped exemplars.
 		# TYPE cortex_distributor_received_exemplars_total counter
@@ -383,14 +402,46 @@ func TestDistributor_MetricsCleanup(t *testing.T) {
 
 		# HELP cortex_distributor_samples_in_total The total number of samples that have come in to the distributor, including rejected or deduped samples.
 		# TYPE cortex_distributor_samples_in_total counter
-		cortex_distributor_samples_in_total{user="userA"} 5
+		cortex_distributor_samples_in_total{type="float",user="userA"} 5
+		cortex_distributor_samples_in_total{type="histogram",user="userB"} 6
 
 		# HELP cortex_distributor_exemplars_in_total The total number of exemplars that have come in to the distributor, including rejected or deduped exemplars.
 		# TYPE cortex_distributor_exemplars_in_total counter
 		cortex_distributor_exemplars_in_total{user="userA"} 5
+		
+		# HELP cortex_distributor_ingester_append_failures_total The total number of failed batch appends sent to ingesters.
+		# TYPE cortex_distributor_ingester_append_failures_total counter
+		cortex_distributor_ingester_append_failures_total{ingester="0",status="2xx",type="metadata"} 1
+		cortex_distributor_ingester_append_failures_total{ingester="1",status="2xx",type="metadata"} 1
+		# HELP cortex_distributor_ingester_appends_total The total number of batch appends sent to ingesters.
+		# TYPE cortex_distributor_ingester_appends_total counter
+		cortex_distributor_ingester_appends_total{ingester="0",type="metadata"} 1
+		cortex_distributor_ingester_appends_total{ingester="1",type="metadata"} 1
+		# HELP cortex_distributor_ingester_queries_total The total number of queries sent to ingesters.
+		# TYPE cortex_distributor_ingester_queries_total counter
+		cortex_distributor_ingester_queries_total{ingester="0"} 1
+		cortex_distributor_ingester_queries_total{ingester="1"} 1
+		# HELP cortex_distributor_ingester_query_failures_total The total number of failed queries sent to ingesters.
+		# TYPE cortex_distributor_ingester_query_failures_total counter
+		cortex_distributor_ingester_query_failures_total{ingester="0"} 1
+		cortex_distributor_ingester_query_failures_total{ingester="1"} 1
 		`), metrics...))
 
 	d.cleanupInactiveUser("userA")
+
+	err := r.KVClient.CAS(context.Background(), ingester.RingKey, func(in interface{}) (interface{}, bool, error) {
+		r := in.(*ring.Desc)
+		delete(r.Ingesters, "0")
+		return in, true, nil
+	})
+
+	test.Poll(t, time.Second, true, func() interface{} {
+		ings, _, _ := r.GetAllInstanceDescs(ring.Write)
+		return len(ings) == 1
+	})
+
+	require.NoError(t, err)
+	d.cleanStaleIngesterMetrics()
 
 	require.NoError(t, testutil.GatherAndCompare(reg, strings.NewReader(`
 		# HELP cortex_distributor_deduped_samples_total The total number of deduplicated samples.
@@ -411,17 +462,32 @@ func TestDistributor_MetricsCleanup(t *testing.T) {
 
 		# HELP cortex_distributor_received_samples_total The total number of received samples, excluding rejected and deduped samples.
 		# TYPE cortex_distributor_received_samples_total counter
-		cortex_distributor_received_samples_total{user="userB"} 10
+		cortex_distributor_received_samples_total{type="float",user="userB"} 10
+		cortex_distributor_received_samples_total{type="histogram",user="userC"} 15
+
+        # HELP cortex_distributor_samples_in_total The total number of samples that have come in to the distributor, including rejected or deduped samples.
+        # TYPE cortex_distributor_samples_in_total counter
+        cortex_distributor_samples_in_total{type="histogram",user="userB"} 6
 
 		# HELP cortex_distributor_received_exemplars_total The total number of received exemplars, excluding rejected and deduped exemplars.
 		# TYPE cortex_distributor_received_exemplars_total counter
 		cortex_distributor_received_exemplars_total{user="userB"} 10
 
-		# HELP cortex_distributor_samples_in_total The total number of samples that have come in to the distributor, including rejected or deduped samples.
-		# TYPE cortex_distributor_samples_in_total counter
-
 		# HELP cortex_distributor_exemplars_in_total The total number of exemplars that have come in to the distributor, including rejected or deduped exemplars.
 		# TYPE cortex_distributor_exemplars_in_total counter
+
+		# HELP cortex_distributor_ingester_append_failures_total The total number of failed batch appends sent to ingesters.
+		# TYPE cortex_distributor_ingester_append_failures_total counter
+		cortex_distributor_ingester_append_failures_total{ingester="1",status="2xx",type="metadata"} 1
+		# HELP cortex_distributor_ingester_appends_total The total number of batch appends sent to ingesters.
+		# TYPE cortex_distributor_ingester_appends_total counter
+		cortex_distributor_ingester_appends_total{ingester="1",type="metadata"} 1
+		# HELP cortex_distributor_ingester_queries_total The total number of queries sent to ingesters.
+		# TYPE cortex_distributor_ingester_queries_total counter
+		cortex_distributor_ingester_queries_total{ingester="1"} 1
+		# HELP cortex_distributor_ingester_query_failures_total The total number of failed queries sent to ingesters.
+		# TYPE cortex_distributor_ingester_query_failures_total counter
+		cortex_distributor_ingester_query_failures_total{ingester="1"} 1
 		`), metrics...))
 }
 
@@ -2101,7 +2167,7 @@ func TestDistributor_MetricsForLabelMatchers(t *testing.T) {
 		shuffleShardEnabled bool
 		shuffleShardSize    int
 		matchers            []*labels.Matcher
-		expectedResult      []metric.Metric
+		expectedResult      []model.Metric
 		expectedIngesters   int
 		queryLimiter        *limiter.QueryLimiter
 		expectedErr         error
@@ -2110,7 +2176,7 @@ func TestDistributor_MetricsForLabelMatchers(t *testing.T) {
 			matchers: []*labels.Matcher{
 				mustNewMatcher(labels.MatchEqual, model.MetricNameLabel, "unknown"),
 			},
-			expectedResult:    []metric.Metric{},
+			expectedResult:    []model.Metric{},
 			expectedIngesters: numIngesters,
 			queryLimiter:      limiter.NewQueryLimiter(0, 0, 0, 0),
 			expectedErr:       nil,
@@ -2119,9 +2185,9 @@ func TestDistributor_MetricsForLabelMatchers(t *testing.T) {
 			matchers: []*labels.Matcher{
 				mustNewMatcher(labels.MatchEqual, model.MetricNameLabel, "test_1"),
 			},
-			expectedResult: []metric.Metric{
-				{Metric: util.LabelsToMetric(fixtures[0].lbls)},
-				{Metric: util.LabelsToMetric(fixtures[1].lbls)},
+			expectedResult: []model.Metric{
+				util.LabelsToMetric(fixtures[0].lbls),
+				util.LabelsToMetric(fixtures[1].lbls),
 			},
 			expectedIngesters: numIngesters,
 			queryLimiter:      limiter.NewQueryLimiter(0, 0, 0, 0),
@@ -2132,8 +2198,8 @@ func TestDistributor_MetricsForLabelMatchers(t *testing.T) {
 				mustNewMatcher(labels.MatchEqual, "status", "200"),
 				mustNewMatcher(labels.MatchEqual, model.MetricNameLabel, "test_1"),
 			},
-			expectedResult: []metric.Metric{
-				{Metric: util.LabelsToMetric(fixtures[0].lbls)},
+			expectedResult: []model.Metric{
+				util.LabelsToMetric(fixtures[0].lbls),
 			},
 			expectedIngesters: numIngesters,
 			queryLimiter:      limiter.NewQueryLimiter(0, 0, 0, 0),
@@ -2143,9 +2209,9 @@ func TestDistributor_MetricsForLabelMatchers(t *testing.T) {
 			matchers: []*labels.Matcher{
 				mustNewMatcher(labels.MatchEqual, model.MetricNameLabel, "fast_fingerprint_collision"),
 			},
-			expectedResult: []metric.Metric{
-				{Metric: util.LabelsToMetric(fixtures[3].lbls)},
-				{Metric: util.LabelsToMetric(fixtures[4].lbls)},
+			expectedResult: []model.Metric{
+				util.LabelsToMetric(fixtures[3].lbls),
+				util.LabelsToMetric(fixtures[4].lbls),
 			},
 			expectedIngesters: numIngesters,
 			queryLimiter:      limiter.NewQueryLimiter(0, 0, 0, 0),
@@ -2157,9 +2223,9 @@ func TestDistributor_MetricsForLabelMatchers(t *testing.T) {
 			matchers: []*labels.Matcher{
 				mustNewMatcher(labels.MatchEqual, model.MetricNameLabel, "test_1"),
 			},
-			expectedResult: []metric.Metric{
-				{Metric: util.LabelsToMetric(fixtures[0].lbls)},
-				{Metric: util.LabelsToMetric(fixtures[1].lbls)},
+			expectedResult: []model.Metric{
+				util.LabelsToMetric(fixtures[0].lbls),
+				util.LabelsToMetric(fixtures[1].lbls),
 			},
 			expectedIngesters: 3,
 			queryLimiter:      limiter.NewQueryLimiter(0, 0, 0, 0),
@@ -2171,9 +2237,9 @@ func TestDistributor_MetricsForLabelMatchers(t *testing.T) {
 			matchers: []*labels.Matcher{
 				mustNewMatcher(labels.MatchEqual, model.MetricNameLabel, "test_1"),
 			},
-			expectedResult: []metric.Metric{
-				{Metric: util.LabelsToMetric(fixtures[0].lbls)},
-				{Metric: util.LabelsToMetric(fixtures[1].lbls)},
+			expectedResult: []model.Metric{
+				util.LabelsToMetric(fixtures[0].lbls),
+				util.LabelsToMetric(fixtures[1].lbls),
 			},
 			expectedIngesters: numIngesters,
 			queryLimiter:      limiter.NewQueryLimiter(0, 0, 0, 0),
@@ -2205,8 +2271,8 @@ func TestDistributor_MetricsForLabelMatchers(t *testing.T) {
 			matchers: []*labels.Matcher{
 				mustNewMatcher(labels.MatchEqual, model.MetricNameLabel, "test_2"),
 			},
-			expectedResult: []metric.Metric{
-				{Metric: util.LabelsToMetric(fixtures[2].lbls)},
+			expectedResult: []model.Metric{
+				util.LabelsToMetric(fixtures[2].lbls),
 			},
 			expectedIngesters: numIngesters,
 			queryLimiter:      limiter.NewQueryLimiter(1, 0, 0, 0),
@@ -2445,6 +2511,22 @@ func mockWriteRequest(lbls []labels.Labels, value float64, timestampMs int64) *c
 	}
 
 	return cortexpb.ToWriteRequest(lbls, samples, nil, nil, cortexpb.API)
+}
+
+// nolint:unused
+func mockHistogramWriteRequest(lbls []labels.Labels, value int, timestampMs int64, float bool) *cortexpb.WriteRequest {
+	histograms := make([]cortexpb.Histogram, len(lbls))
+	for i := range lbls {
+		if float {
+			fh := histogram_util.GenerateTestFloatHistogram(value)
+			histograms[i] = cortexpb.FloatHistogramToHistogramProto(timestampMs, fh)
+			continue
+		}
+		h := histogram_util.GenerateTestHistogram(value)
+		histograms[i] = cortexpb.HistogramToHistogramProto(timestampMs, h)
+	}
+
+	return cortexpb.ToWriteRequest(lbls, nil, nil, histograms, cortexpb.API)
 }
 
 type prepConfig struct {
@@ -2920,35 +3002,26 @@ func (i *mockIngester) QueryStream(ctx context.Context, req *client.QueryRequest
 			continue
 		}
 
-		c, err := encoding.NewForEncoding(encoding.PrometheusXorChunk)
+		c := chunkenc.NewXORChunk()
+		appender, err := c.Appender()
 		if err != nil {
 			return nil, err
 		}
-		chunks := []encoding.Chunk{c}
+		chunks := []chunkenc.Chunk{c}
 		for _, sample := range ts.Samples {
-			newChunk, err := c.Add(model.SamplePair{
-				Timestamp: model.Time(sample.TimestampMs),
-				Value:     model.SampleValue(sample.Value),
-			})
-			if err != nil {
-				panic(err)
-			}
-			if newChunk != nil {
-				c = newChunk
-				chunks = append(chunks, newChunk)
-			}
+			appender.Append(sample.TimestampMs, sample.Value)
 		}
 
 		wireChunks := []client.Chunk{}
 		for _, c := range chunks {
-			var buf bytes.Buffer
+			e, err := promchunk.FromPromChunkEncoding(c.Encoding())
+			if err != nil {
+				return nil, err
+			}
 			chunk := client.Chunk{
-				Encoding: int32(c.Encoding()),
+				Encoding: int32(e),
+				Data:     c.Bytes(),
 			}
-			if err := c.Marshal(&buf); err != nil {
-				panic(err)
-			}
-			chunk.Data = buf.Bytes()
 			wireChunks = append(wireChunks, chunk)
 		}
 
@@ -3539,9 +3612,6 @@ func TestDistributor_Push_RelabelDropWillExportMetricOfDroppedSamples(t *testing
 		limits:           &limits,
 	})
 
-	regs[0].MustRegister(validation.DiscardedSamples)
-	validation.DiscardedSamples.Reset()
-
 	// Push the series to the distributor
 	req := mockWriteRequest(inputSeries, 1, 1)
 	ctx := user.InjectOrgID(context.Background(), "userDistributorPushRelabelDropWillExportMetricOfDroppedSamples")
@@ -3563,9 +3633,9 @@ func TestDistributor_Push_RelabelDropWillExportMetricOfDroppedSamples(t *testing
 		cortex_discarded_samples_total{reason="relabel_configuration",user="userDistributorPushRelabelDropWillExportMetricOfDroppedSamples"} 1
 		# HELP cortex_distributor_received_samples_total The total number of received samples, excluding rejected and deduped samples.
 		# TYPE cortex_distributor_received_samples_total counter
-		cortex_distributor_received_samples_total{user="userDistributorPushRelabelDropWillExportMetricOfDroppedSamples"} 1
+        cortex_distributor_received_samples_total{type="float",user="userDistributorPushRelabelDropWillExportMetricOfDroppedSamples"} 1
+        cortex_distributor_received_samples_total{type="histogram",user="userDistributorPushRelabelDropWillExportMetricOfDroppedSamples"} 0
 		`
-
 	require.NoError(t, testutil.GatherAndCompare(regs[0], strings.NewReader(expectedMetrics), metrics...))
 }
 

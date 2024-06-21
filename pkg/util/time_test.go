@@ -11,6 +11,9 @@ import (
 	"github.com/prometheus/prometheus/promql/parser"
 	"github.com/stretchr/testify/assert"
 	"github.com/stretchr/testify/require"
+	"go.uber.org/atomic"
+
+	"github.com/cortexproject/cortex/pkg/util/test"
 )
 
 func TestTimeFromMillis(t *testing.T) {
@@ -187,4 +190,81 @@ func TestFindMinMaxTime(t *testing.T) {
 			assert.Equal(t, testData.expectedMaxTime.Truncate(time.Minute).UnixMilli(), maxTime)
 		})
 	}
+}
+
+func TestSlottedTicker(t *testing.T) {
+	t.Parallel()
+	testCases := map[string]struct {
+		duration   time.Duration
+		totalSlots int
+		slotNumber int
+	}{
+		"No Slots should spread across all the interval": {
+			duration:   300 * time.Millisecond,
+			totalSlots: 1,
+			slotNumber: 0,
+		},
+		"Get first slot": {
+			duration:   300 * time.Millisecond,
+			totalSlots: 5,
+			slotNumber: 0,
+		},
+		"Get 3th slot": {
+			duration:   300 * time.Millisecond,
+			totalSlots: 5,
+			slotNumber: 3,
+		},
+		"Get last slot": {
+			duration:   300 * time.Millisecond,
+			totalSlots: 5,
+			slotNumber: 4,
+		},
+	}
+	for name, c := range testCases {
+		tc := c
+		t.Run(name, func(t *testing.T) {
+			infoFunc := func() (int, int) {
+				return tc.slotNumber, tc.totalSlots
+			}
+			ticker := NewSlottedTicker(infoFunc, tc.duration, 0)
+			slotSize := tc.duration.Milliseconds() / int64(tc.totalSlots)
+			successCount := 0
+
+			test.Poll(t, 5*time.Second, true, func() interface{} {
+				tTime := <-ticker.C
+				slotShiftInMs := tTime.UnixMilli() % tc.duration.Milliseconds()
+				slot := slotShiftInMs / slotSize
+				if slot == int64(tc.slotNumber) {
+					successCount++
+				} else {
+					successCount--
+				}
+
+				return successCount == 10
+			})
+			ticker.Stop()
+		})
+	}
+
+	t.Run("Change slot size", func(t *testing.T) {
+		slotSize := atomic.NewInt32(10)
+		d := 300 * time.Millisecond
+		infoFunc := func() (int, int) {
+			return 2, int(slotSize.Load())
+		}
+
+		ticker := NewSlottedTicker(infoFunc, d, 0)
+
+		test.Poll(t, 5*time.Second, true, func() interface{} {
+			tTime := <-ticker.C
+			slotShiftInMs := tTime.UnixMilli() % d.Milliseconds()
+			return slotShiftInMs >= 60 && slotShiftInMs <= 90
+		})
+		slotSize.Store(5)
+		test.Poll(t, 2*time.Second, true, func() interface{} {
+			tTime := <-ticker.C
+			slotShiftInMs := tTime.UnixMilli() % d.Milliseconds()
+			return slotShiftInMs >= 120 && slotShiftInMs <= 180
+		})
+	})
 }

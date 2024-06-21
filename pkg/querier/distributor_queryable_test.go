@@ -16,10 +16,8 @@ import (
 	"github.com/weaveworks/common/user"
 
 	"github.com/cortexproject/cortex/pkg/chunk"
-	"github.com/cortexproject/cortex/pkg/chunk/encoding"
 	"github.com/cortexproject/cortex/pkg/cortexpb"
 	"github.com/cortexproject/cortex/pkg/ingester/client"
-	"github.com/cortexproject/cortex/pkg/prom1/storage/metric"
 	"github.com/cortexproject/cortex/pkg/querier/batch"
 	"github.com/cortexproject/cortex/pkg/util"
 	"github.com/cortexproject/cortex/pkg/util/chunkcompat"
@@ -36,7 +34,6 @@ func TestDistributorQuerier_SelectShouldHonorQueryIngestersWithin(t *testing.T) 
 
 	tests := map[string]struct {
 		querySeries          bool
-		queryStoreForLabels  bool
 		queryIngestersWithin time.Duration
 		queryMinT            int64
 		queryMaxT            int64
@@ -71,17 +68,8 @@ func TestDistributorQuerier_SelectShouldHonorQueryIngestersWithin(t *testing.T) 
 			expectedMinT:         0,
 			expectedMaxT:         0,
 		},
-		"should not manipulate query time range if queryIngestersWithin is enabled and query max time is older, but the query is for /series": {
+		"should manipulate query time range if queryIngestersWithin is enabled": {
 			querySeries:          true,
-			queryIngestersWithin: time.Hour,
-			queryMinT:            util.TimeToMillis(now.Add(-100 * time.Minute)),
-			queryMaxT:            util.TimeToMillis(now.Add(-90 * time.Minute)),
-			expectedMinT:         util.TimeToMillis(now.Add(-100 * time.Minute)),
-			expectedMaxT:         util.TimeToMillis(now.Add(-90 * time.Minute)),
-		},
-		"should manipulate query time range if queryIngestersWithin is enabled and queryStoreForLabels is enabled": {
-			querySeries:          true,
-			queryStoreForLabels:  true,
 			queryIngestersWithin: time.Hour,
 			queryMinT:            util.TimeToMillis(now.Add(-100 * time.Minute)),
 			queryMaxT:            util.TimeToMillis(now.Add(-30 * time.Minute)),
@@ -98,11 +86,11 @@ func TestDistributorQuerier_SelectShouldHonorQueryIngestersWithin(t *testing.T) 
 
 				distributor := &MockDistributor{}
 				distributor.On("QueryStream", mock.Anything, mock.Anything, mock.Anything, mock.Anything).Return(&client.QueryStreamResponse{}, nil)
-				distributor.On("MetricsForLabelMatchers", mock.Anything, mock.Anything, mock.Anything, mock.Anything).Return([]metric.Metric{}, nil)
-				distributor.On("MetricsForLabelMatchersStream", mock.Anything, mock.Anything, mock.Anything, mock.Anything).Return([]metric.Metric{}, nil)
+				distributor.On("MetricsForLabelMatchers", mock.Anything, mock.Anything, mock.Anything, mock.Anything).Return([]model.Metric{}, nil)
+				distributor.On("MetricsForLabelMatchersStream", mock.Anything, mock.Anything, mock.Anything, mock.Anything).Return([]model.Metric{}, nil)
 
 				ctx := user.InjectOrgID(context.Background(), "test")
-				queryable := newDistributorQueryable(distributor, streamingMetadataEnabled, nil, testData.queryIngestersWithin, testData.queryStoreForLabels)
+				queryable := newDistributorQueryable(distributor, streamingMetadataEnabled, nil, testData.queryIngestersWithin)
 				querier, err := queryable.Querier(testData.queryMinT, testData.queryMaxT)
 				require.NoError(t, err)
 
@@ -141,7 +129,7 @@ func TestDistributorQueryableFilter(t *testing.T) {
 	t.Parallel()
 
 	d := &MockDistributor{}
-	dq := newDistributorQueryable(d, false, nil, 1*time.Hour, true)
+	dq := newDistributorQueryable(d, false, nil, 1*time.Hour)
 
 	now := time.Now()
 
@@ -160,10 +148,10 @@ func TestIngesterStreaming(t *testing.T) {
 
 	// We need to make sure that there is at least one chunk present,
 	// else no series will be selected.
-	promChunk, err := encoding.NewForEncoding(encoding.PrometheusXorChunk)
+	promChunk := chunkenc.NewXORChunk()
+	appender, err := promChunk.Appender()
 	require.NoError(t, err)
-	_, err = promChunk.Add(model.ZeroSamplePair)
-	require.NoError(t, err)
+	appender.Append(int64(model.ZeroSamplePair.Timestamp), float64(model.ZeroSamplePair.Value))
 
 	clientChunks, err := chunkcompat.ToChunks([]chunk.Chunk{
 		chunk.NewChunk(nil, promChunk, model.Earliest, model.Earliest),
@@ -191,7 +179,7 @@ func TestIngesterStreaming(t *testing.T) {
 		nil)
 
 	ctx := user.InjectOrgID(context.Background(), "0")
-	queryable := newDistributorQueryable(d, true, batch.NewChunkMergeIterator, 0, true)
+	queryable := newDistributorQueryable(d, true, batch.NewChunkMergeIterator, 0)
 	querier, err := queryable.Querier(mint, maxt)
 	require.NoError(t, err)
 
@@ -210,99 +198,6 @@ func TestIngesterStreaming(t *testing.T) {
 	require.NoError(t, seriesSet.Err())
 }
 
-func TestIngesterStreamingMixedResults(t *testing.T) {
-	t.Parallel()
-
-	const (
-		mint = 0
-		maxt = 10000
-	)
-	s1 := []cortexpb.Sample{
-		{Value: 1, TimestampMs: 1000},
-		{Value: 2, TimestampMs: 2000},
-		{Value: 3, TimestampMs: 3000},
-		{Value: 4, TimestampMs: 4000},
-		{Value: 5, TimestampMs: 5000},
-	}
-	s2 := []cortexpb.Sample{
-		{Value: 1, TimestampMs: 1000},
-		{Value: 2.5, TimestampMs: 2500},
-		{Value: 3, TimestampMs: 3000},
-		{Value: 5.5, TimestampMs: 5500},
-	}
-
-	mergedSamplesS1S2 := []cortexpb.Sample{
-		{Value: 1, TimestampMs: 1000},
-		{Value: 2, TimestampMs: 2000},
-		{Value: 2.5, TimestampMs: 2500},
-		{Value: 3, TimestampMs: 3000},
-		{Value: 4, TimestampMs: 4000},
-		{Value: 5, TimestampMs: 5000},
-		{Value: 5.5, TimestampMs: 5500},
-	}
-
-	d := &MockDistributor{}
-	d.On("QueryStream", mock.Anything, mock.Anything, mock.Anything, mock.Anything).Return(
-		&client.QueryStreamResponse{
-			Chunkseries: []client.TimeSeriesChunk{
-				{
-					Labels: []cortexpb.LabelAdapter{{Name: labels.MetricName, Value: "one"}},
-					Chunks: convertToChunks(t, s1),
-				},
-				{
-					Labels: []cortexpb.LabelAdapter{{Name: labels.MetricName, Value: "two"}},
-					Chunks: convertToChunks(t, s1),
-				},
-			},
-
-			Timeseries: []cortexpb.TimeSeries{
-				{
-					Labels:  []cortexpb.LabelAdapter{{Name: labels.MetricName, Value: "two"}},
-					Samples: s2,
-				},
-				{
-					Labels:  []cortexpb.LabelAdapter{{Name: labels.MetricName, Value: "three"}},
-					Samples: s1,
-				},
-			},
-		},
-		nil)
-
-	ctx := user.InjectOrgID(context.Background(), "0")
-	queryable := newDistributorQueryable(d, true, batch.NewChunkMergeIterator, 0, true)
-	querier, err := queryable.Querier(mint, maxt)
-	require.NoError(t, err)
-
-	seriesSet := querier.Select(ctx, true, &storage.SelectHints{Start: mint, End: maxt}, labels.MustNewMatcher(labels.MatchRegexp, labels.MetricName, ".*"))
-	require.NoError(t, seriesSet.Err())
-
-	require.True(t, seriesSet.Next())
-	verifySeries(t, seriesSet.At(), labels.Labels{{Name: labels.MetricName, Value: "one"}}, s1)
-
-	require.True(t, seriesSet.Next())
-	verifySeries(t, seriesSet.At(), labels.Labels{{Name: labels.MetricName, Value: "three"}}, s1)
-
-	require.True(t, seriesSet.Next())
-	verifySeries(t, seriesSet.At(), labels.Labels{{Name: labels.MetricName, Value: "two"}}, mergedSamplesS1S2)
-
-	require.False(t, seriesSet.Next())
-	require.NoError(t, seriesSet.Err())
-}
-
-func verifySeries(t *testing.T, series storage.Series, l labels.Labels, samples []cortexpb.Sample) {
-	require.Equal(t, l, series.Labels())
-
-	it := series.Iterator(nil)
-	for _, s := range samples {
-		require.NotEqual(t, it.Next(), chunkenc.ValNone)
-		require.Nil(t, it.Err())
-		ts, v := it.At()
-		require.Equal(t, s.Value, v)
-		require.Equal(t, s.TimestampMs, ts)
-	}
-	require.Equal(t, it.Next(), chunkenc.ValNone)
-	require.Nil(t, it.Err())
-}
 func TestDistributorQuerier_LabelNames(t *testing.T) {
 	t.Parallel()
 
@@ -314,10 +209,10 @@ func TestDistributorQuerier_LabelNames(t *testing.T) {
 		t.Run("with matchers", func(t *testing.T) {
 			t.Parallel()
 
-			metrics := []metric.Metric{
-				{Metric: model.Metric{"foo": "bar"}},
-				{Metric: model.Metric{"job": "baz"}},
-				{Metric: model.Metric{"job": "baz", "foo": "boom"}},
+			metrics := []model.Metric{
+				{"foo": "bar"},
+				{"job": "baz"},
+				{"job": "baz", "foo": "boom"},
 			}
 			d := &MockDistributor{}
 			d.On("MetricsForLabelMatchers", mock.Anything, model.Time(mint), model.Time(maxt), someMatchers).
@@ -325,7 +220,7 @@ func TestDistributorQuerier_LabelNames(t *testing.T) {
 			d.On("MetricsForLabelMatchersStream", mock.Anything, model.Time(mint), model.Time(maxt), someMatchers).
 				Return(metrics, nil)
 
-			queryable := newDistributorQueryable(d, streamingEnabled, nil, 0, true)
+			queryable := newDistributorQueryable(d, streamingEnabled, nil, 0)
 			querier, err := queryable.Querier(mint, maxt)
 			require.NoError(t, err)
 
@@ -336,24 +231,4 @@ func TestDistributorQuerier_LabelNames(t *testing.T) {
 			assert.Equal(t, labelNames, names)
 		})
 	}
-}
-
-func convertToChunks(t *testing.T, samples []cortexpb.Sample) []client.Chunk {
-	// We need to make sure that there is at least one chunk present,
-	// else no series will be selected.
-	promChunk, err := encoding.NewForEncoding(encoding.PrometheusXorChunk)
-	require.NoError(t, err)
-
-	for _, s := range samples {
-		c, err := promChunk.Add(model.SamplePair{Value: model.SampleValue(s.Value), Timestamp: model.Time(s.TimestampMs)})
-		require.NoError(t, err)
-		require.Nil(t, c)
-	}
-
-	clientChunks, err := chunkcompat.ToChunks([]chunk.Chunk{
-		chunk.NewChunk(nil, promChunk, model.Time(samples[0].TimestampMs), model.Time(samples[len(samples)-1].TimestampMs)),
-	})
-	require.NoError(t, err)
-
-	return clientChunks
 }

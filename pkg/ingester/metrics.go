@@ -17,6 +17,11 @@ const (
 	memSeriesRemovedTotalHelp = "The total number of series that were removed per user."
 )
 
+const (
+	sampleMetricTypeFloat     = "float"
+	sampleMetricTypeHistogram = "histogram"
+)
+
 type ingesterMetrics struct {
 	ingestedSamples         prometheus.Counter
 	ingestedExemplars       prometheus.Counter
@@ -38,6 +43,8 @@ type ingesterMetrics struct {
 	memMetadataRemovedTotal *prometheus.CounterVec
 
 	activeSeriesPerUser *prometheus.GaugeVec
+	limitsPerLabelSet   *prometheus.GaugeVec
+	usagePerLabelSet    *prometheus.GaugeVec
 
 	// Global limit metrics
 	maxUsersGauge           prometheus.GaugeFunc
@@ -211,6 +218,16 @@ func newIngesterMetrics(r prometheus.Registerer,
 			return 0
 		}),
 
+		limitsPerLabelSet: promauto.With(r).NewGaugeVec(prometheus.GaugeOpts{
+			Name: "cortex_ingester_limits_per_labelset",
+			Help: "Limits per user and labelset.",
+		}, []string{"user", "limit", "labelset"}),
+
+		usagePerLabelSet: promauto.With(r).NewGaugeVec(prometheus.GaugeOpts{
+			Name: "cortex_ingester_usage_per_labelset",
+			Help: "Current usage per user and labelset.",
+		}, []string{"user", "limit", "labelset"}),
+
 		// Not registered automatically, but only if activeSeriesEnabled is true.
 		activeSeriesPerUser: prometheus.NewGaugeVec(prometheus.GaugeOpts{
 			Name: "cortex_ingester_active_series",
@@ -281,11 +298,14 @@ type tsdbMetrics struct {
 	tsdbMmapChunkCorruptionTotal       *prometheus.Desc
 	tsdbChunkwriteQueueOperationsTotal *prometheus.Desc
 	tsdbSamplesAppended                *prometheus.Desc
-	tsdbOutOfOrderSamplesAppended      *prometheus.Desc
-	tsdbSnapshotReplayErrorTotal       *prometheus.Desc
-	tsdbOOOHistogram                   *prometheus.Desc
-	tsdbMmapChunksTotal                *prometheus.Desc
-	tsdbDataTotalReplayDuration        *prometheus.Desc
+	// Although there is an existing sample-out-of-order discarded samples metric, some samples can still
+	// be dropped silently due to OOO at commit phase, and it doesn't increment the discarded samples metric.
+	tsdbOOOSamples                *prometheus.Desc
+	tsdbOutOfOrderSamplesAppended *prometheus.Desc
+	tsdbSnapshotReplayErrorTotal  *prometheus.Desc
+	tsdbOOOHistogram              *prometheus.Desc
+	tsdbMmapChunksTotal           *prometheus.Desc
+	tsdbDataTotalReplayDuration   *prometheus.Desc
 
 	tsdbExemplarsTotal          *prometheus.Desc
 	tsdbExemplarsInStorage      *prometheus.Desc
@@ -460,11 +480,15 @@ func newTSDBMetrics(r prometheus.Registerer) *tsdbMetrics {
 		tsdbSamplesAppended: prometheus.NewDesc(
 			"cortex_ingester_tsdb_head_samples_appended_total",
 			"Total number of appended samples.",
-			[]string{"type", "user"}, nil),
+			[]string{"user", "type"}, nil),
+		tsdbOOOSamples: prometheus.NewDesc(
+			"cortex_ingester_tsdb_out_of_order_samples_total",
+			"Total number of out of order samples ingestion failed attempts due to out of order being disabled.",
+			[]string{"user", "type"}, nil),
 		tsdbOutOfOrderSamplesAppended: prometheus.NewDesc(
 			"cortex_ingester_tsdb_head_out_of_order_samples_appended_total",
 			"Total number of appended out of order samples.",
-			[]string{"user"}, nil),
+			[]string{"user", "type"}, nil),
 		tsdbSnapshotReplayErrorTotal: prometheus.NewDesc(
 			"cortex_ingester_tsdb_snapshot_replay_error_total",
 			"Total number snapshot replays that failed.",
@@ -547,6 +571,7 @@ func (sm *tsdbMetrics) Describe(out chan<- *prometheus.Desc) {
 	out <- sm.tsdbTimeRetentionCount
 	out <- sm.tsdbBlocksBytes
 	out <- sm.tsdbSamplesAppended
+	out <- sm.tsdbOOOSamples
 	out <- sm.tsdbOutOfOrderSamplesAppended
 	out <- sm.tsdbSnapshotReplayErrorTotal
 	out <- sm.tsdbOOOHistogram
@@ -603,7 +628,8 @@ func (sm *tsdbMetrics) Collect(out chan<- prometheus.Metric) {
 	data.SendSumOfCounters(out, sm.tsdbTimeRetentionCount, "prometheus_tsdb_time_retentions_total")
 	data.SendSumOfGaugesPerUser(out, sm.tsdbBlocksBytes, "prometheus_tsdb_storage_blocks_bytes")
 	data.SendSumOfCountersPerUserWithLabels(out, sm.tsdbSamplesAppended, "prometheus_tsdb_head_samples_appended_total", "type")
-	data.SendSumOfCountersPerUser(out, sm.tsdbOutOfOrderSamplesAppended, "prometheus_tsdb_head_out_of_order_samples_appended_total")
+	data.SendSumOfCountersPerUserWithLabels(out, sm.tsdbOOOSamples, "prometheus_tsdb_out_of_order_samples_total", "type")
+	data.SendSumOfCountersPerUserWithLabels(out, sm.tsdbOutOfOrderSamplesAppended, "prometheus_tsdb_head_out_of_order_samples_appended_total", "type")
 	data.SendSumOfCounters(out, sm.tsdbSnapshotReplayErrorTotal, "prometheus_tsdb_snapshot_replay_error_total")
 	data.SendSumOfHistograms(out, sm.tsdbOOOHistogram, "prometheus_tsdb_sample_ooo_delta")
 	data.SendSumOfGauges(out, sm.tsdbMmapChunksTotal, "prometheus_tsdb_mmap_chunks_total")

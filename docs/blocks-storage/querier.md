@@ -117,12 +117,6 @@ querier:
   # CLI flag: -querier.query-ingesters-within
   [query_ingesters_within: <duration> | default = 0s]
 
-  # Deprecated (Querying long-term store for labels will be always enabled in
-  # the future.): Query long-term store for series, label values and label names
-  # APIs.
-  # CLI flag: -querier.query-store-for-labels-enabled
-  [query_store_for_labels_enabled: <boolean> | default = false]
-
   # Enable returning samples stats per steps in query response.
   # CLI flag: -querier.per-step-stats-enabled
   [per_step_stats_enabled: <boolean> | default = false]
@@ -1372,8 +1366,9 @@ blocks_storage:
     [ship_concurrency: <int> | default = 10]
 
     # How frequently does Cortex try to compact TSDB head. Block is only created
-    # if data covers smallest block range. Must be greater than 0 and max 5
-    # minutes.
+    # if data covers smallest block range. Must be greater than 0 and max 30
+    # minutes. Note that up to 50% jitter is added to the value for the first
+    # compaction to avoid ingesters compacting concurrently.
     # CLI flag: -blocks-storage.tsdb.head-compaction-interval
     [head_compaction_interval: <duration> | default = 1m]
 
@@ -1446,4 +1441,8 @@ blocks_storage:
     # be out-of-order.
     # CLI flag: -blocks-storage.tsdb.out-of-order-cap-max
     [out_of_order_cap_max: <int> | default = 32]
+
+    # [EXPERIMENTAL] True to enable native histogram.
+    # CLI flag: -blocks-storage.tsdb.enable-native-histograms
+    [enable_native_histograms: <boolean> | default = false]
 ```

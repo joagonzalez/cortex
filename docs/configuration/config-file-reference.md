@@ -1924,8 +1924,9 @@ tsdb:
   [ship_concurrency: <int> | default = 10]
 
   # How frequently does Cortex try to compact TSDB head. Block is only created
-  # if data covers smallest block range. Must be greater than 0 and max 5
-  # minutes.
+  # if data covers smallest block range. Must be greater than 0 and max 30
+  # minutes. Note that up to 50% jitter is added to the value for the first
+  # compaction to avoid ingesters compacting concurrently.
   # CLI flag: -blocks-storage.tsdb.head-compaction-interval
   [head_compaction_interval: <duration> | default = 1m]
 
@@ -1997,6 +1998,10 @@ tsdb:
   # be out-of-order.
   # CLI flag: -blocks-storage.tsdb.out-of-order-cap-max
   [out_of_order_cap_max: <int> | default = 32]
+
+  # [EXPERIMENTAL] True to enable native histogram.
+  # CLI flag: -blocks-storage.tsdb.enable-native-histograms
+  [enable_native_histograms: <boolean> | default = false]
 ```
 
 ### `compactor_config`
@@ -2605,6 +2610,10 @@ The `etcd_config` configures the etcd client. The supported CLI flags `<prefix>`
 # Etcd password.
 # CLI flag: -<prefix>.etcd.password
 [password: <string> | default = ""]
+
+# Send Keepalive pings with no streams.
+# CLI flag: -<prefix>.etcd.ping-without-stream-allowed
+[ping-without-stream-allowed: <boolean> | default = true]
 ```
 
 ### `fifo_cache_config`
@@ -2829,6 +2838,13 @@ lifecycler:
     # CLI flag: -distributor.excluded-zones
     [excluded_zones: <string> | default = ""]
 
+    # Set to true to enable ring detailed metrics. These metrics provide
+    # detailed information, such as token count and ownership per tenant.
+    # Disabling them can significantly decrease the number of metrics emitted by
+    # the distributors.
+    # CLI flag: -ring.detailed-metrics-enabled
+    [detailed_metrics_enabled: <boolean> | default = true]
+
   # Number of tokens for each ingester.
   # CLI flag: -ingester.num-tokens
   [num_tokens: <int> | default = 128]
@@ -2915,6 +2931,10 @@ lifecycler:
 # After what time a series is considered to be inactive.
 # CLI flag: -ingester.active-series-metrics-idle-timeout
 [active_series_metrics_idle_timeout: <duration> | default = 10m]
+
+# Enable uploading compacted blocks.
+# CLI flag: -ingester.upload-compacted-blocks-enabled
+[upload_compacted_blocks_enabled: <boolean> | default = true]
 
 instance_limits:
   # Max ingestion rate (samples/sec) that ingester will accept. This limit is
@@ -3025,6 +3045,11 @@ grpc_client_config:
   # Skip validating server certificate.
   # CLI flag: -ingester.client.tls-insecure-skip-verify
   [tls_insecure_skip_verify: <boolean> | default = false]
+
+# Max inflight push requests that this ingester client can handle. This limit is
+# per-ingester-client. Additional requests will be rejected. 0 = unlimited.
+# CLI flag: -ingester.client.max-inflight-push-requests
+[max_inflight_push_requests: <int> | default = 0]
 ```
 
 ### `limits_config`
@@ -3131,14 +3156,6 @@ The `limits_config` configures default and per-tenant limits imposed by Cortex s
 # CLI flag: -ingester.max-exemplars
 [max_exemplars: <int> | default = 0]
 
-# The maximum number of series for which a query can fetch samples from each
-# ingester. This limit is enforced only in the ingesters (when querying samples
-# not flushed to the storage yet) and it's a per-instance limit. This limit is
-# ignored when running the Cortex blocks storage. When running Cortex with
-# blocks storage use -querier.max-fetched-series-per-query limit instead.
-# CLI flag: -ingester.max-series-per-query
-[max_series_per_query: <int> | default = 100000]
-
 # The maximum number of active series per user, per ingester. 0 to disable.
 # CLI flag: -ingester.max-series-per-user
 [max_series_per_user: <int> | default = 5000000]
@@ -3158,6 +3175,10 @@ The `limits_config` configures default and per-tenant limits imposed by Cortex s
 # replication. 0 to disable.
 # CLI flag: -ingester.max-global-series-per-metric
 [max_global_series_per_metric: <int> | default = 0]
+
+# [Experimental] Enable limits per LabelSet. Supported limits per labelSet:
+# [max_series]
+[limits_per_label_set: <list of LimitsPerLabelSet> | default = []]
 
 # The maximum number of active metrics with metadata per user, per ingester. 0
 # to disable.
@@ -3627,11 +3648,6 @@ The `querier_config` configures the Cortex querier.
 # CLI flag: -querier.query-ingesters-within
 [query_ingesters_within: <duration> | default = 0s]
 
-# Deprecated (Querying long-term store for labels will be always enabled in the
-# future.): Query long-term store for series, label values and label names APIs.
-# CLI flag: -querier.query-store-for-labels-enabled
-[query_store_for_labels_enabled: <boolean> | default = false]
-
 # Enable returning samples stats per steps in query response.
 # CLI flag: -querier.per-step-stats-enabled
 [per_step_stats_enabled: <boolean> | default = false]
@@ -4000,7 +4016,7 @@ The `ruler_config` configures the Cortex ruler.
 [external_url: <url> | default = ]
 
 # Labels to add to all alerts.
-[external_labels: <list of Label> | default = []]
+[external_labels: <map of string (labelName) to string (labelValue)> | default = []]
 
 ruler_client:
   # gRPC client max receive message size (bytes).
@@ -4249,6 +4265,11 @@ ring:
   # different availability zones for API HA.
   # CLI flag: -ruler.ring.zone-awareness-enabled
   [zone_awareness_enabled: <boolean> | default = false]
+
+  # EXPERIMENTAL: File path where tokens are stored. If empty, tokens are not
+  # stored at shutdown and restored at startup.
+  # CLI flag: -ruler.ring.tokens-file-path
+  [tokens_file_path: <string> | default = ""]
 
   # Name of network interface to read address from.
   # CLI flag: -ruler.ring.instance-interface-names
@@ -5297,6 +5318,19 @@ otel:
     [tls_insecure_skip_verify: <boolean> | default = false]
 ```
 
+### `LimitsPerLabelSet`
+
+```yaml
+limits:
+  # The maximum number of active series per LabelSet, across the cluster before
+  # replication. Setting the value 0 will enable the monitoring (metrics) but
+  # would not enforce any limits.
+  [max_series: <int> | default = ]
+
+# LabelSet which the limit should be applied.
+[label_set: <map of string (labelName) to string (labelValue)> | default = []]
+```
+
 ### `PriorityDef`
 
 ```yaml
@@ -5340,12 +5374,4 @@ time_window:
 
 # name of the rule group
 [name: <string> | default = ""]
-```
-
-### `Label`
-
-```yaml
-[name: <string> | default = ""]
-
-[value: <string> | default = ""]
 ```

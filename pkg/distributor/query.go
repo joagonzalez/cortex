@@ -70,7 +70,7 @@ func (d *Distributor) QueryStream(ctx context.Context, from, to model.Time, matc
 		}
 
 		if s := opentracing.SpanFromContext(ctx); s != nil {
-			s.LogKV("chunk-series", len(result.GetChunkseries()), "time-series", len(result.GetTimeseries()))
+			s.LogKV("chunk-series", len(result.GetChunkseries()))
 		}
 		return nil
 	})
@@ -253,12 +253,8 @@ func (d *Distributor) queryIngesterStream(ctx context.Context, replicationSet ri
 				return nil, validation.LimitError(chunkLimitErr.Error())
 			}
 
-			s := make([][]cortexpb.LabelAdapter, 0, len(resp.Chunkseries)+len(resp.Timeseries))
+			s := make([][]cortexpb.LabelAdapter, 0, len(resp.Chunkseries))
 			for _, series := range resp.Chunkseries {
-				s = append(s, series.Labels)
-			}
-
-			for _, series := range resp.Timeseries {
 				s = append(s, series.Labels)
 			}
 
@@ -275,7 +271,6 @@ func (d *Distributor) queryIngesterStream(ctx context.Context, replicationSet ri
 			}
 
 			result.Chunkseries = append(result.Chunkseries, resp.Chunkseries...)
-			result.Timeseries = append(result.Timeseries, resp.Timeseries...)
 		}
 		return result, nil
 	})
@@ -286,7 +281,6 @@ func (d *Distributor) queryIngesterStream(ctx context.Context, replicationSet ri
 	span, _ := opentracing.StartSpanFromContext(ctx, "Distributor.MergeIngesterStreams")
 	defer span.Finish()
 	hashToChunkseries := map[string]ingester_client.TimeSeriesChunk{}
-	hashToTimeSeries := map[string]cortexpb.TimeSeries{}
 
 	for _, result := range results {
 		response := result.(*ingester_client.QueryStreamResponse)
@@ -299,84 +293,27 @@ func (d *Distributor) queryIngesterStream(ctx context.Context, replicationSet ri
 			existing.Chunks = append(existing.Chunks, series.Chunks...)
 			hashToChunkseries[key] = existing
 		}
-
-		// Parse any time series
-		for _, series := range response.Timeseries {
-			key := ingester_client.LabelsToKeyString(cortexpb.FromLabelAdaptersToLabels(series.Labels))
-			existing := hashToTimeSeries[key]
-			existing.Labels = series.Labels
-			if existing.Samples == nil {
-				existing.Samples = series.Samples
-			} else {
-				existing.Samples = mergeSamples(existing.Samples, series.Samples)
-			}
-			hashToTimeSeries[key] = existing
-		}
 	}
 
 	resp := &ingester_client.QueryStreamResponse{
 		Chunkseries: make([]ingester_client.TimeSeriesChunk, 0, len(hashToChunkseries)),
-		Timeseries:  make([]cortexpb.TimeSeries, 0, len(hashToTimeSeries)),
 	}
 	for _, series := range hashToChunkseries {
 		resp.Chunkseries = append(resp.Chunkseries, series)
-	}
-	for _, series := range hashToTimeSeries {
-		resp.Timeseries = append(resp.Timeseries, series)
 	}
 
 	respSize := resp.Size()
 	chksSize := resp.ChunksSize()
 	chksCount := resp.ChunksCount()
-	span.SetTag("fetched_series", len(resp.Chunkseries)+len(resp.Timeseries))
+	span.SetTag("fetched_series", len(resp.Chunkseries))
 	span.SetTag("fetched_chunks", chksCount)
 	span.SetTag("fetched_data_bytes", respSize)
 	span.SetTag("fetched_chunks_bytes", chksSize)
-	reqStats.AddFetchedSeries(uint64(len(resp.Chunkseries) + len(resp.Timeseries)))
+	reqStats.AddFetchedSeries(uint64(len(resp.Chunkseries)))
 	reqStats.AddFetchedChunkBytes(uint64(chksSize))
 	reqStats.AddFetchedDataBytes(uint64(respSize))
 	reqStats.AddFetchedChunks(uint64(chksCount))
 	reqStats.AddFetchedSamples(uint64(resp.SamplesCount()))
 
 	return resp, nil
-}
-
-// Merges and dedupes two sorted slices with samples together.
-func mergeSamples(a, b []cortexpb.Sample) []cortexpb.Sample {
-	if sameSamples(a, b) {
-		return a
-	}
-
-	result := make([]cortexpb.Sample, 0, len(a)+len(b))
-	i, j := 0, 0
-	for i < len(a) && j < len(b) {
-		if a[i].TimestampMs < b[j].TimestampMs {
-			result = append(result, a[i])
-			i++
-		} else if a[i].TimestampMs > b[j].TimestampMs {
-			result = append(result, b[j])
-			j++
-		} else {
-			result = append(result, a[i])
-			i++
-			j++
-		}
-	}
-	// Add the rest of a or b. One of them is empty now.
-	result = append(result, a[i:]...)
-	result = append(result, b[j:]...)
-	return result
-}
-
-func sameSamples(a, b []cortexpb.Sample) bool {
-	if len(a) != len(b) {
-		return false
-	}
-
-	for i := 0; i < len(a); i++ {
-		if a[i] != b[i] {
-			return false
-		}
-	}
-	return true
 }

@@ -1,6 +1,7 @@
 package validation
 
 import (
+	"errors"
 	"net/http"
 	"strings"
 	"time"
@@ -68,52 +69,66 @@ const (
 	ExemplarMaxLabelSetLength = 128
 )
 
-// DiscardedSamples is a metric of the number of discarded samples, by reason.
-var DiscardedSamples = prometheus.NewCounterVec(
-	prometheus.CounterOpts{
-		Name: "cortex_discarded_samples_total",
-		Help: "The total number of samples that were discarded.",
-	},
-	[]string{discardReasonLabel, "user"},
-)
-
-// DiscardedExemplars is a metric of the number of discarded exemplars, by reason.
-var DiscardedExemplars = prometheus.NewCounterVec(
-	prometheus.CounterOpts{
-		Name: "cortex_discarded_exemplars_total",
-		Help: "The total number of exemplars that were discarded.",
-	},
-	[]string{discardReasonLabel, "user"},
-)
-
-// DiscardedMetadata is a metric of the number of discarded metadata, by reason.
-var DiscardedMetadata = prometheus.NewCounterVec(
-	prometheus.CounterOpts{
-		Name: "cortex_discarded_metadata_total",
-		Help: "The total number of metadata that were discarded.",
-	},
-	[]string{discardReasonLabel, "user"},
-)
-
-func init() {
-	prometheus.MustRegister(DiscardedSamples)
-	prometheus.MustRegister(DiscardedExemplars)
-	prometheus.MustRegister(DiscardedMetadata)
+type ValidateMetrics struct {
+	DiscardedSamples   *prometheus.CounterVec
+	DiscardedExemplars *prometheus.CounterVec
+	DiscardedMetadata  *prometheus.CounterVec
 }
 
-// ValidateSample returns an err if the sample is invalid.
-// The returned error may retain the provided series labels.
-func ValidateSample(limits *Limits, userID string, ls []cortexpb.LabelAdapter, s cortexpb.Sample) ValidationError {
-	unsafeMetricName, _ := extract.UnsafeMetricNameFromLabelAdapters(ls)
+func registerCollector(r prometheus.Registerer, c prometheus.Collector) {
+	err := r.Register(c)
+	if err != nil && !errors.As(err, &prometheus.AlreadyRegisteredError{}) {
+		panic(err)
+	}
+}
 
-	if limits.RejectOldSamples && model.Time(s.TimestampMs) < model.Now().Add(-time.Duration(limits.RejectOldSamplesMaxAge)) {
-		DiscardedSamples.WithLabelValues(greaterThanMaxSampleAge, userID).Inc()
-		return newSampleTimestampTooOldError(unsafeMetricName, s.TimestampMs)
+func NewValidateMetrics(r prometheus.Registerer) *ValidateMetrics {
+	discardedSamples := prometheus.NewCounterVec(
+		prometheus.CounterOpts{
+			Name: "cortex_discarded_samples_total",
+			Help: "The total number of samples that were discarded.",
+		},
+		[]string{discardReasonLabel, "user"},
+	)
+	registerCollector(r, discardedSamples)
+	discardedExemplars := prometheus.NewCounterVec(
+		prometheus.CounterOpts{
+			Name: "cortex_discarded_exemplars_total",
+			Help: "The total number of exemplars that were discarded.",
+		},
+		[]string{discardReasonLabel, "user"},
+	)
+	registerCollector(r, discardedExemplars)
+	discardedMetadata := prometheus.NewCounterVec(
+		prometheus.CounterOpts{
+			Name: "cortex_discarded_metadata_total",
+			Help: "The total number of metadata that were discarded.",
+		},
+		[]string{discardReasonLabel, "user"},
+	)
+	registerCollector(r, discardedMetadata)
+	m := &ValidateMetrics{
+		DiscardedSamples:   discardedSamples,
+		DiscardedExemplars: discardedExemplars,
+		DiscardedMetadata:  discardedMetadata,
 	}
 
-	if model.Time(s.TimestampMs) > model.Now().Add(time.Duration(limits.CreationGracePeriod)) {
-		DiscardedSamples.WithLabelValues(tooFarInFuture, userID).Inc()
-		return newSampleTimestampTooNewError(unsafeMetricName, s.TimestampMs)
+	return m
+}
+
+// ValidateSampleTimestamp returns an err if the sample timestamp is invalid.
+// The returned error may retain the provided series labels.
+func ValidateSampleTimestamp(validateMetrics *ValidateMetrics, limits *Limits, userID string, ls []cortexpb.LabelAdapter, timestampMs int64) ValidationError {
+	unsafeMetricName, _ := extract.UnsafeMetricNameFromLabelAdapters(ls)
+
+	if limits.RejectOldSamples && model.Time(timestampMs) < model.Now().Add(-time.Duration(limits.RejectOldSamplesMaxAge)) {
+		validateMetrics.DiscardedSamples.WithLabelValues(greaterThanMaxSampleAge, userID).Inc()
+		return newSampleTimestampTooOldError(unsafeMetricName, timestampMs)
+	}
+
+	if model.Time(timestampMs) > model.Now().Add(time.Duration(limits.CreationGracePeriod)) {
+		validateMetrics.DiscardedSamples.WithLabelValues(tooFarInFuture, userID).Inc()
+		return newSampleTimestampTooNewError(unsafeMetricName, timestampMs)
 	}
 
 	return nil
@@ -121,14 +136,14 @@ func ValidateSample(limits *Limits, userID string, ls []cortexpb.LabelAdapter, s
 
 // ValidateExemplar returns an error if the exemplar is invalid.
 // The returned error may retain the provided series labels.
-func ValidateExemplar(userID string, ls []cortexpb.LabelAdapter, e cortexpb.Exemplar) ValidationError {
+func ValidateExemplar(validateMetrics *ValidateMetrics, userID string, ls []cortexpb.LabelAdapter, e cortexpb.Exemplar) ValidationError {
 	if len(e.Labels) <= 0 {
-		DiscardedExemplars.WithLabelValues(exemplarLabelsMissing, userID).Inc()
+		validateMetrics.DiscardedExemplars.WithLabelValues(exemplarLabelsMissing, userID).Inc()
 		return newExemplarEmtpyLabelsError(ls, []cortexpb.LabelAdapter{}, e.TimestampMs)
 	}
 
 	if e.TimestampMs == 0 {
-		DiscardedExemplars.WithLabelValues(exemplarTimestampInvalid, userID).Inc()
+		validateMetrics.DiscardedExemplars.WithLabelValues(exemplarTimestampInvalid, userID).Inc()
 		return newExemplarMissingTimestampError(
 			ls,
 			e.Labels,
@@ -145,7 +160,7 @@ func ValidateExemplar(userID string, ls []cortexpb.LabelAdapter, e cortexpb.Exem
 	}
 
 	if labelSetLen > ExemplarMaxLabelSetLength {
-		DiscardedExemplars.WithLabelValues(exemplarLabelsTooLong, userID).Inc()
+		validateMetrics.DiscardedExemplars.WithLabelValues(exemplarLabelsTooLong, userID).Inc()
 		return newExemplarLabelLengthError(
 			ls,
 			e.Labels,
@@ -158,23 +173,23 @@ func ValidateExemplar(userID string, ls []cortexpb.LabelAdapter, e cortexpb.Exem
 
 // ValidateLabels returns an err if the labels are invalid.
 // The returned error may retain the provided series labels.
-func ValidateLabels(limits *Limits, userID string, ls []cortexpb.LabelAdapter, skipLabelNameValidation bool) ValidationError {
+func ValidateLabels(validateMetrics *ValidateMetrics, limits *Limits, userID string, ls []cortexpb.LabelAdapter, skipLabelNameValidation bool) ValidationError {
 	if limits.EnforceMetricName {
 		unsafeMetricName, err := extract.UnsafeMetricNameFromLabelAdapters(ls)
 		if err != nil {
-			DiscardedSamples.WithLabelValues(missingMetricName, userID).Inc()
+			validateMetrics.DiscardedSamples.WithLabelValues(missingMetricName, userID).Inc()
 			return newNoMetricNameError()
 		}
 
 		if !model.IsValidMetricName(model.LabelValue(unsafeMetricName)) {
-			DiscardedSamples.WithLabelValues(invalidMetricName, userID).Inc()
+			validateMetrics.DiscardedSamples.WithLabelValues(invalidMetricName, userID).Inc()
 			return newInvalidMetricNameError(unsafeMetricName)
 		}
 	}
 
 	numLabelNames := len(ls)
 	if numLabelNames > limits.MaxLabelNamesPerSeries {
-		DiscardedSamples.WithLabelValues(maxLabelNamesPerSeries, userID).Inc()
+		validateMetrics.DiscardedSamples.WithLabelValues(maxLabelNamesPerSeries, userID).Inc()
 		return newTooManyLabelsError(ls, limits.MaxLabelNamesPerSeries)
 	}
 
@@ -186,21 +201,21 @@ func ValidateLabels(limits *Limits, userID string, ls []cortexpb.LabelAdapter, s
 
 	for _, l := range ls {
 		if !skipLabelNameValidation && !model.LabelName(l.Name).IsValid() {
-			DiscardedSamples.WithLabelValues(invalidLabel, userID).Inc()
+			validateMetrics.DiscardedSamples.WithLabelValues(invalidLabel, userID).Inc()
 			return newInvalidLabelError(ls, l.Name)
 		} else if len(l.Name) > maxLabelNameLength {
-			DiscardedSamples.WithLabelValues(labelNameTooLong, userID).Inc()
+			validateMetrics.DiscardedSamples.WithLabelValues(labelNameTooLong, userID).Inc()
 			return newLabelNameTooLongError(ls, l.Name, maxLabelNameLength)
 		} else if len(l.Value) > maxLabelValueLength {
-			DiscardedSamples.WithLabelValues(labelValueTooLong, userID).Inc()
+			validateMetrics.DiscardedSamples.WithLabelValues(labelValueTooLong, userID).Inc()
 			return newLabelValueTooLongError(ls, l.Name, l.Value, maxLabelValueLength)
 		} else if cmp := strings.Compare(lastLabelName, l.Name); cmp >= 0 {
 			if cmp == 0 {
-				DiscardedSamples.WithLabelValues(duplicateLabelNames, userID).Inc()
+				validateMetrics.DiscardedSamples.WithLabelValues(duplicateLabelNames, userID).Inc()
 				return newDuplicatedLabelError(ls, l.Name)
 			}
 
-			DiscardedSamples.WithLabelValues(labelsNotSorted, userID).Inc()
+			validateMetrics.DiscardedSamples.WithLabelValues(labelsNotSorted, userID).Inc()
 			return newLabelsNotSortedError(ls, l.Name)
 		}
 
@@ -208,16 +223,16 @@ func ValidateLabels(limits *Limits, userID string, ls []cortexpb.LabelAdapter, s
 		labelsSizeBytes += l.Size()
 	}
 	if maxLabelsSizeBytes > 0 && labelsSizeBytes > maxLabelsSizeBytes {
-		DiscardedSamples.WithLabelValues(labelsSizeBytesExceeded, userID).Inc()
+		validateMetrics.DiscardedSamples.WithLabelValues(labelsSizeBytesExceeded, userID).Inc()
 		return labelSizeBytesExceededError(ls, labelsSizeBytes, maxLabelsSizeBytes)
 	}
 	return nil
 }
 
 // ValidateMetadata returns an err if a metric metadata is invalid.
-func ValidateMetadata(cfg *Limits, userID string, metadata *cortexpb.MetricMetadata) error {
+func ValidateMetadata(validateMetrics *ValidateMetrics, cfg *Limits, userID string, metadata *cortexpb.MetricMetadata) error {
 	if cfg.EnforceMetadataMetricName && metadata.GetMetricFamilyName() == "" {
-		DiscardedMetadata.WithLabelValues(missingMetricName, userID).Inc()
+		validateMetrics.DiscardedMetadata.WithLabelValues(missingMetricName, userID).Inc()
 		return httpgrpc.Errorf(http.StatusBadRequest, errMetadataMissingMetricName)
 	}
 
@@ -240,23 +255,23 @@ func ValidateMetadata(cfg *Limits, userID string, metadata *cortexpb.MetricMetad
 	}
 
 	if reason != "" {
-		DiscardedMetadata.WithLabelValues(reason, userID).Inc()
+		validateMetrics.DiscardedMetadata.WithLabelValues(reason, userID).Inc()
 		return httpgrpc.Errorf(http.StatusBadRequest, errMetadataTooLong, metadataType, cause, metadata.GetMetricFamilyName())
 	}
 
 	return nil
 }
 
-func DeletePerUserValidationMetrics(userID string, log log.Logger) {
+func DeletePerUserValidationMetrics(validateMetrics *ValidateMetrics, userID string, log log.Logger) {
 	filter := map[string]string{"user": userID}
 
-	if err := util.DeleteMatchingLabels(DiscardedSamples, filter); err != nil {
+	if err := util.DeleteMatchingLabels(validateMetrics.DiscardedSamples, filter); err != nil {
 		level.Warn(log).Log("msg", "failed to remove cortex_discarded_samples_total metric for user", "user", userID, "err", err)
 	}
-	if err := util.DeleteMatchingLabels(DiscardedExemplars, filter); err != nil {
+	if err := util.DeleteMatchingLabels(validateMetrics.DiscardedExemplars, filter); err != nil {
 		level.Warn(log).Log("msg", "failed to remove cortex_discarded_exemplars_total metric for user", "user", userID, "err", err)
 	}
-	if err := util.DeleteMatchingLabels(DiscardedMetadata, filter); err != nil {
+	if err := util.DeleteMatchingLabels(validateMetrics.DiscardedMetadata, filter); err != nil {
 		level.Warn(log).Log("msg", "failed to remove cortex_discarded_metadata_total metric for user", "user", userID, "err", err)
 	}
 }
